@@ -117,6 +117,10 @@ $(foreach id,$(EMULATORS),$(eval $(call emulator_rules,$(id))))
 # tinyalsa PCM output, shared by every emulator.
 TINYALSA_OBJS = $(TINYALSA_SRCS:%.c=$(TARGET_DIR)/tinyalsa/%.o)
 
+# The sources appear only when the pinned fetch runs; without this rule a
+# clean checkout finds no way to make them and skips the pattern rule below.
+$(TINYALSA_SRCS:%=$(TINYALSA_DIR)/src/%): $(TINYALSA_DIR)/.pinned ;
+
 $(TARGET_DIR)/tinyalsa/%.o: $(TINYALSA_DIR)/src/%.c $(TINYALSA_DIR)/.pinned
 	@mkdir -p $(dir $@)
 	$(CROSS_CC) $(TINYALSA_CFLAGS) $(TARGET_CPU_FLAGS) $(TARGET_SECTION_FLAGS) -c $< -o $@
