@@ -1,0 +1,39 @@
+name: Release
+
+# Push a tag such as v2026.10.16.1 to publish. The player's Emulator Store reads
+# index.json from the latest release and downloads every file from it.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the mipsel musl cross toolchain
+        shell: bash
+        run: .github/scripts/install-toolchain.sh "$RUNNER_TEMP/toolchain" | tail -n 1 >> "$GITHUB_PATH"
+      - name: Build for the device
+        run: make
+      - name: Host self-test
+        run: make selftest
+      - name: Build the release assets
+        run: make package TAG="$GITHUB_REF_NAME"
+      - name: Validate the store index
+        run: python3 tools/build_index.py --validate dist
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - > notes.md <<'PY'
+          import json
+          index = json.load(open("dist/index.json"))
+          print("Emulators in this release:\n")
+          for e in index["emulators"]:
+              print(f"- **{e['name']}** {e['version']}: {e['description']}")
+          PY
+          gh release create "$GITHUB_REF_NAME" dist/* --title "Emulators $GITHUB_REF_NAME" --notes-file notes.md --latest

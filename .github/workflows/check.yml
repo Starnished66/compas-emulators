@@ -1,0 +1,26 @@
+name: Check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the mipsel musl cross toolchain
+        shell: bash
+        run: .github/scripts/install-toolchain.sh "$RUNNER_TEMP/toolchain" | tail -n 1 >> "$GITHUB_PATH"
+      - name: Build for the device
+        run: make
+      - name: Host self-test
+        run: make selftest
+      - name: Build the packages and the store index
+        run: make package
+      - name: Validate the store index
+        run: python3 tools/build_index.py --validate dist
