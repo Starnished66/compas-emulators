@@ -1,13 +1,13 @@
 {
   "id": "quicknes",
   "name": "QuickNES",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "protocol": 1,
   "exec": "quicknes",
   "systems": [
-    { "id": "nes", "name": "NES", "games_dir": "NES", "extensions": ["nes"] }
+    { "id": "nes", "name": "Nintendo Entertainment System", "games_dir": "NES", "extensions": ["nes"] }
   ],
   "author": "Compás",
   "license": "GPL-3.0 and LGPL-2.1-or-later",
-  "description": "Nintendo Entertainment System emulator based on QuickNES."
+  "description": "Plays Nintendo Entertainment System (NES, Famicom) games. Based on QuickNES."
 }

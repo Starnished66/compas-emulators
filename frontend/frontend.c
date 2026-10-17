@@ -4,11 +4,20 @@
  *
  * It maps the framebuffer, grabs every input device so the player underneath
  * sees no events, draws the game at the top of the screen with touch
- * controls below it, and paces itself on blocking audio writes. It exits on
- * the on-screen EXIT box, a one second power button hold, or SIGTERM. */
+ * controls below it (a presenter thread owns the framebuffer pan, see
+ * present.h), and paces itself on blocking audio writes. A tap in the
+ * middle of the game or a short power button press opens the pause menu
+ * (resume, save state, load state, reset, exit); a one second power button
+ * hold or SIGTERM exits from anywhere. Per-emulator settings (which buttons
+ * to draw, core option answers) come from the "frontend" object of the
+ * emulator's own emulator.json, see config.h. */
 #include "frontend.h"
 
+#include "config.h"
 #include "glyph5x7.h"
+#include "present.h"
+#include "stretch.h"
+#include "xrun.h"
 #include "libretro.h"
 
 #include <dirent.h>
@@ -40,17 +49,27 @@
 #endif
 #define LOG_PREFIX EMULATOR_ID ": "
 #define MAX_SURFACE_WIDTH 1024
+#define MAX_SURFACE_HEIGHT 2048
 #define MAX_INPUT_DEVICES 8
 #define MAX_CONTACTS 10
 #define POWER_HOLD_QUIT_NS 1000000000ull
 #define RELEASE_WAIT_NS 2000000000ull
 #define WATCHDOG_STALL_SECONDS 5
 #define TOUCH_TRACE_LINES 40
+/* The game area never takes more than this share of the screen height; a
+ * taller picture is narrowed instead, so the controls always fit. */
+#define MAX_GAME_PERCENT 68
+#define TAP_MAX_NS 300000000ull
+#define TAP_MAX_MOVE_PX 24
 
 static volatile sig_atomic_t quit_flag;
 static atomic_uint heartbeat; /* advanced by every pass of the main loop */
 static enum retro_pixel_format pixfmt = RETRO_PIXEL_FORMAT_0RGB1555;
 static char save_dir[512] = ".";
+static char emu_dir[512] = ".";        /* the emulator's own folder: system directory and emulator.json */
+static frontend_config_t cfg;
+static bool variables_dirty;           /* answer GET_VARIABLE_UPDATE once after loading */
+static bool video_skip;                /* the video of the frame being run is not wanted (frameskip) */
 
 static uint64_t now_ns(void) {
     struct timespec ts;
@@ -77,23 +96,41 @@ static void runner_log(const char * fmt, ...) {
 
 static uint16_t * surf;              /* where the next frame is scaled to */
 static int surf_w, surf_h, surf_stride; /* stride in pixels */
-static int max_game_h;               /* rows available above the controls */
-static int game_h;                   /* scaled game height */
-static int xmap[MAX_SURFACE_WIDTH], ymap[MAX_SURFACE_WIDTH];
+static int max_game_h;               /* tallest game area allowed */
+static int game_h;                   /* scaled game height of the current frame */
+static int draw_w, draw_x0;          /* scaled width and left margin (narrowed pictures are centered) */
+static int xmap[MAX_SURFACE_WIDTH], ymap[MAX_SURFACE_HEIGHT];
 static int map_src_w, map_src_h;
 static unsigned last_src_w, last_src_h;
-static uint64_t video_frames;
+static uint64_t video_frames;        /* frames scaled and shown */
+static uint64_t video_skipped;       /* frames whose video was skipped on request */
 static uint64_t scale_ns_total;
+static uint16_t * shadow;            /* scaled copy of the last game frame, for the pause menu */
+static int shadow_rows;              /* rows of it that hold a frame */
+static bool capture_frame;           /* video_cb also stores the frame in shadow */
 
-static void flip_page(void);
+static void relayout_for_game(void);
+static void fb_claim(void);
+static void fb_release(void);
+static void present_frame(void);
 
+/* Width-fit scaling: the picture fills the screen width unless that would
+ * make it taller than max_game_h, then it is narrowed to keep its shape. */
 static void build_maps(int src_w, int src_h) {
     map_src_w = src_w;
     map_src_h = src_h;
-    game_h = src_h * surf_w / src_w;
-    if (game_h > max_game_h) game_h = max_game_h;
-    for (int x = 0; x < surf_w; x++) xmap[x] = x * src_w / surf_w;
-    for (int y = 0; y < game_h; y++) ymap[y] = y * src_h / game_h;
+    int h = (int) ((int64_t) src_h * surf_w / src_w);
+    draw_w = surf_w;
+    if (h > max_game_h) {
+        h = max_game_h;
+        draw_w = (int) ((int64_t) src_w * h / src_h);
+        if (draw_w < 1) draw_w = 1;
+        if (draw_w > surf_w) draw_w = surf_w;
+    }
+    game_h = h < 1 ? 1 : h;
+    draw_x0 = (surf_w - draw_w) / 2;
+    for (int x = 0; x < draw_w; x++) xmap[x] = (int) ((int64_t) x * src_w / draw_w);
+    for (int y = 0; y < game_h; y++) ymap[y] = (int) ((int64_t) y * src_h / game_h);
 }
 
 static inline uint16_t pixel_to_565(const void * row, int x) {
@@ -106,34 +143,78 @@ static inline uint16_t pixel_to_565(const void * row, int x) {
     return (uint16_t) (((p & 0x7FE0) << 1) | (p & 0x1F));
 }
 
+/* Two pixels written at once into the uint16_t row buffer. */
+typedef uint32_t __attribute__((may_alias)) pixel_pair_t;
+
+/* One scaled row from RGB565 source pixels through xmap, two pixels per
+ * 32-bit store. line + draw_x0 must be 4-byte aligned and draw_w even. */
+static inline void scale_row_pairs(const uint16_t * r, uint16_t * dst) {
+    pixel_pair_t * out = (pixel_pair_t *) dst;
+    for (int x = 0; x < draw_w; x += 2)
+        *out++ = (uint32_t) r[xmap[x]] | ((uint32_t) r[xmap[x + 1]] << 16);
+}
+
+/* The 1.5x case (320 -> 480): destination pixels 0..5 of every 4 source
+ * pixels are s0 s0 s1 s2 s2 s3, so three words per four source pixels. */
+static inline void scale_row_3_2(const uint16_t * r, uint16_t * dst, int src_w) {
+    pixel_pair_t * out = (pixel_pair_t *) dst;
+    for (int x = 0; x < src_w; x += 4) {
+        uint32_t s0 = r[x], s1 = r[x + 1], s2 = r[x + 2], s3 = r[x + 3];
+        out[0] = s0 | (s0 << 16);
+        out[1] = s1 | (s2 << 16);
+        out[2] = s2 | (s3 << 16);
+        out += 3;
+    }
+}
+
 /* Framebuffer memory is uncached: never read it back, and write whole rows
  * with memcpy from a row composed in normal RAM. */
 static void video_cb(const void * data, unsigned w, unsigned h, size_t pitch) {
-    static uint16_t line[MAX_SURFACE_WIDTH];
+    static uint16_t line[MAX_SURFACE_WIDTH] __attribute__((aligned(8)));
     if (!data || !surf || !w || !h) return;
-    uint64_t t0 = now_ns();
     last_src_w = w;
     last_src_h = h;
-    if ((int) w != map_src_w || (int) h != map_src_h) build_maps((int) w, (int) h);
+    if (video_skip) {
+        video_skipped++;
+        return;
+    }
+    uint64_t t0 = now_ns();
+    if ((int) w != map_src_w || (int) h != map_src_h) {
+        int old_game_h = game_h;
+        build_maps((int) w, (int) h);
+        memset(line, 0, sizeof(line)); /* margins of a narrowed picture stay black */
+        /* Only a change of the game area height moves the controls. */
+        if (game_h != old_game_h) relayout_for_game();
+    }
+    bool keep = capture_frame && shadow;
     const uint8_t * src = data;
+    const bool rgb565 = pixfmt == RETRO_PIXEL_FORMAT_RGB565;
+    const bool pairs = rgb565 && draw_w % 2 == 0 && draw_x0 % 2 == 0;
+    const bool three_halves = pairs && draw_x0 == 0 && map_src_w % 4 == 0 && draw_w * 2 == map_src_w * 3;
     int last_sy = -1;
     for (int y = 0; y < game_h; y++) {
         int sy = ymap[y];
         if (sy != last_sy) {
             const void * row = src + (size_t) sy * pitch;
-            if (pixfmt == RETRO_PIXEL_FORMAT_RGB565) {
+            if (three_halves) {
+                scale_row_3_2(row, line, map_src_w);
+            } else if (pairs) {
+                scale_row_pairs(row, line + draw_x0);
+            } else if (rgb565) {
                 const uint16_t * r = row;
-                for (int x = 0; x < surf_w; x++) line[x] = r[xmap[x]];
+                for (int x = 0; x < draw_w; x++) line[draw_x0 + x] = r[xmap[x]];
             } else {
-                for (int x = 0; x < surf_w; x++) line[x] = pixel_to_565(row, xmap[x]);
+                for (int x = 0; x < draw_w; x++) line[draw_x0 + x] = pixel_to_565(row, xmap[x]);
             }
             last_sy = sy;
         }
         memcpy(surf + (size_t) y * surf_stride, line, (size_t) surf_w * 2);
+        if (keep) memcpy(shadow + (size_t) y * surf_w, line, (size_t) surf_w * 2);
     }
+    if (keep) shadow_rows = game_h;
     scale_ns_total += now_ns() - t0;
     video_frames++;
-    flip_page();
+    present_frame();
 }
 
 /* ---- audio ---- */
@@ -167,20 +248,103 @@ static void audio_sample_cb(int16_t l, int16_t r) {
 #define AUDIO_OPEN_TIMEOUT_MS 2000
 
 static struct pcm * pcm;
-static unsigned audio_errors;
+static xrun_stats_t audio_xr;        /* real underruns and recoveries, see xrun.h */
+static stretch_t stretch;
+static uint32_t stretch_ratio_q16 = STRETCH_Q16_ONE;
+static double stretch_next_log;      /* audio seconds of the next periodic log line */
+#endif
 
+/* The codec only has the usual rates. A core with another one (gpSP renders
+ * at 32768 or 65536 Hz) is resampled to 48000 Hz with linear interpolation. */
+static unsigned device_rate_for(unsigned rate) {
+    static const unsigned standard[] = { 8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000, 88200, 96000 };
+    for (size_t i = 0; i < sizeof(standard) / sizeof(standard[0]); i++)
+        if (rate == standard[i]) return rate;
+    return 48000;
+}
+
+static unsigned core_rate, device_rate;
+/* Read position in input frames, 32.32 fixed point, counted from the carried
+ * frame: 0 is the frame kept from the previous block, 1.0 is the first frame
+ * of this block. Integer only, so the cost does not depend on an FPU. */
+static uint64_t resample_pos;
+static uint64_t resample_step;       /* input frames per output frame, 32.32 */
+static int16_t resample_prev[2];     /* last input frame of the previous block */
+static int16_t * resample_buf;
+static size_t resample_cap;
+static uint64_t resample_base_step;  /* resample_step at ratio 1.0 */
+/* Audio stretching (cfg.audio_stretch); the controller state is with the device below. */
+static bool stretch_on;
+
+/* Converts audio_buf to the device rate with linear interpolation; returns
+ * the frames in resample_buf. */
+static size_t resample_audio(void) {
+    const size_t n = audio_buf_frames;
+    const uint64_t end = (uint64_t) n << 32;
+    size_t out = 0;
+    while (resample_pos < end && out < resample_cap) {
+        const size_t k = (size_t) (resample_pos >> 32);
+        const int32_t f = (int32_t) ((resample_pos >> 17) & 0x7FFF); /* 15 bits: (b - a) * f fits in 32 */
+        for (size_t ch = 0; ch < 2; ch++) {
+            const int32_t a = k ? audio_buf[(k - 1) * 2 + ch] : resample_prev[ch];
+            const int32_t b = audio_buf[k * 2 + ch];
+            resample_buf[out * 2 + ch] = (int16_t) (a + (((b - a) * f) >> 15));
+        }
+        out++;
+        resample_pos += resample_step;
+    }
+    if (n) {
+        resample_prev[0] = audio_buf[(n - 1) * 2];
+        resample_prev[1] = audio_buf[(n - 1) * 2 + 1];
+        resample_pos = resample_pos > end ? resample_pos - end : 0;
+    }
+    return out;
+}
+
+static bool resample_init(unsigned rate) {
+    core_rate = rate;
+    device_rate = device_rate_for(rate);
+    resample_pos = 0;
+    resample_base_step = (((uint64_t) core_rate << 32) + device_rate / 2) / device_rate;
+    resample_step = resample_base_step;
+    memset(resample_prev, 0, sizeof(resample_prev));
+    free(resample_buf);
+    resample_buf = NULL;
+    resample_cap = 0;
+    if (device_rate == core_rate && !stretch_on) return true;
+    resample_cap = (size_t) ((double) (sizeof(audio_buf) / sizeof(audio_buf[0]) / 2) * device_rate / core_rate /
+                             (stretch_on ? STRETCH_MIN_RATIO : 1.0)) + 8;
+    resample_buf = malloc(resample_cap * 4);
+    if (!resample_buf) {
+        runner_log("audio: out of memory (continuing silent)");
+        return false;
+    }
+    if (device_rate != core_rate) runner_log("audio: core rate %u Hz resampled to %u Hz", core_rate, device_rate);
+    return true;
+}
+
+#ifndef HOST_BUILD
 static bool audio_open(unsigned rate) {
-    struct pcm_config cfg = { 0 };
-    cfg.channels = 2;
-    cfg.rate = rate;
-    cfg.period_size = AUDIO_PERIOD_FRAMES;
-    cfg.period_count = AUDIO_PERIOD_COUNT;
-    cfg.format = PCM_FORMAT_S16_LE;
-    cfg.start_threshold = cfg.period_size * cfg.period_count;
-    cfg.stop_threshold = cfg.period_size * cfg.period_count;
+    struct pcm_config pcfg = { 0 };
+    stretch_on = cfg.audio_stretch;
+    if (!resample_init(rate)) return false;
+    pcfg.channels = 2;
+    pcfg.rate = device_rate;
+    pcfg.period_size = AUDIO_PERIOD_FRAMES;
+    pcfg.period_count = AUDIO_PERIOD_COUNT;
+    pcfg.format = PCM_FORMAT_S16_LE;
+    pcfg.start_threshold = pcfg.period_size * pcfg.period_count;
+    pcfg.stop_threshold = pcfg.period_size * pcfg.period_count;
     for (int waited_ms = 0;; waited_ms += AUDIO_OPEN_RETRY_MS) {
-        pcm = pcm_open(0, 0, PCM_OUT, &cfg);
-        if (pcm && pcm_is_ready(pcm)) return true;
+        /* PCM_NORESTART: tinyalsa then reports an xrun (-1 with errno EPIPE) instead of recovering silently. */
+        pcm = pcm_open(0, 0, PCM_OUT | PCM_NORESTART, &pcfg);
+        if (pcm && pcm_is_ready(pcm)) {
+            stretch_init(&stretch, pcm_get_buffer_size(pcm), device_rate);
+            stretch_ratio_q16 = STRETCH_Q16_ONE;
+            stretch_next_log = 10.0;
+            memset(&audio_xr, 0, sizeof(audio_xr));
+            return true;
+        }
         const char * why = pcm ? pcm_get_error(pcm) : "open failed";
         if (waited_ms >= AUDIO_OPEN_TIMEOUT_MS) {
             runner_log("audio: %s (continuing silent)", why);
@@ -194,26 +358,106 @@ static bool audio_open(unsigned rate) {
     }
 }
 
+/* pcm_state is not in tinyalsa's public header but is a plain exported function of pcm.c. */
+int pcm_state(struct pcm * pcm);
+
+/* Frames in the device buffer for the stretch controller, or -1 when there is
+ * no valid reading. pcm_get_htimestamp reports "avail" = hw_ptr + buffer_size -
+ * appl_ptr (pcm_mmap_playback_avail in src/pcm.c) from the last successful
+ * SNDRV_PCM_IOCTL_SYNC_PTR; on this kernel (MIPS, no coherent mmap of the
+ * status and control pages, sound/core/pcm_native.c) tinyalsa always uses that
+ * ioctl. It keeps the previous values without any error when the sync fails,
+ * which happens in the XRUN state (the hwsync returns -EPIPE) and while the
+ * stream is prepared but not started, so a reading is only trusted while the
+ * state is RUNNING. A count above the buffer size is the hardware pointer
+ * having passed the application pointer (see stretch_fill_from_avail). */
+static int device_fill(void) {
+    unsigned avail;
+    struct timespec ts;
+    if (pcm_get_htimestamp(pcm, &avail, &ts) < 0) return -1;
+    if (pcm_state(pcm) != PCM_STATE_RUNNING) return -1;
+    return stretch_fill_from_avail(avail, pcm_get_buffer_size(pcm));
+}
+
+static int pcm_write_op(void * ctx, const int16_t * data, unsigned frames) {
+    return pcm_writei(ctx, data, frames);
+}
+
+static bool pcm_prepare_op(void * ctx) {
+    return pcm_prepare(ctx) == 0;
+}
+
+/* Writes frames to the device, counting and recovering from underruns. */
+static bool pcm_write_counted(const int16_t * data, unsigned frames) {
+    const xrun_device_t dev = { pcm_write_op, pcm_prepare_op, pcm };
+    return xrun_write_all(&dev, &audio_xr, data, frames);
+}
+
 /* False when the write failed, so the caller paces the frame itself. */
 static bool audio_flush(void) {
     bool ok = pcm != NULL;
-    if (pcm && audio_buf_frames && pcm_writei(pcm, audio_buf, (unsigned) audio_buf_frames) < 0) {
-        audio_errors++;
-        pcm_prepare(pcm);
-        ok = false;
+    const int16_t * out = audio_buf;
+    size_t frames = audio_buf_frames;
+    if (audio_buf_frames) {
+        if (device_rate != core_rate || stretch_ratio_q16 != STRETCH_Q16_ONE) {
+            resample_step = stretch_step(resample_base_step, stretch_ratio_q16);
+            frames = resample_audio();
+            out = resample_buf;
+        } else {
+            /* Plain path; keep the resampler ready (one frame behind the input, as it runs). */
+            resample_prev[0] = audio_buf[(audio_buf_frames - 1) * 2];
+            resample_prev[1] = audio_buf[(audio_buf_frames - 1) * 2 + 1];
+            resample_pos = 1ull << 32;
+        }
+    }
+    if (pcm && frames) ok = pcm_write_counted(out, (unsigned) frames);
+    if (ok && pcm && frames && stretch_on) {
+        const int fill = device_fill();
+        if (fill >= 0) {
+            stretch_ratio_q16 = stretch_update(&stretch, (unsigned) fill, (unsigned) frames);
+            if (stretch.seconds >= stretch_next_log) {
+                stretch_next_log += 10.0;
+                if (stretch_ratio_q16 != STRETCH_Q16_ONE)
+                    runner_log("audio stretch: ratio %.3f, device fill %d of %u frames, underruns %u",
+                               (double) stretch_ratio_q16 / STRETCH_Q16_ONE, fill, stretch.buffer_frames,
+                               audio_xr.underruns);
+            }
+        }
     }
     audio_buf_frames = 0;
     return ok;
 }
 
+/* One period of silence while the game is paused: keeps the device fed (no
+ * underrun, no repeated last buffer) and paces the pause loop like real audio
+ * does. False when there is no working device and the caller must sleep. */
+static bool audio_silence(void) {
+    static const int16_t quiet[AUDIO_PERIOD_FRAMES * 2];
+    if (!pcm) return false;
+    return pcm_write_counted(quiet, AUDIO_PERIOD_FRAMES);
+}
+
 static void audio_close(void) {
     if (pcm) pcm_close(pcm);
     pcm = NULL;
-    if (audio_errors) runner_log("audio write errors: %u", audio_errors);
+    runner_log("audio: real underruns %u (ALSA EPIPE on write), suspends %u, prepare recoveries %u, write errors %u",
+               audio_xr.underruns, audio_xr.suspends, audio_xr.prepares, audio_xr.errors);
+    if (stretch_on && stretch.seconds > 0) {
+        stretch_stats_t st;
+        stretch_stats(&stretch, &st);
+        runner_log("audio stretch: ratio min %.3f avg %.3f, stretched %.1f%% of %.0fs, device fill avg %.0f%% "
+                   "(readings while the stream was running)", st.min_ratio, st.avg_ratio, st.stretched_percent,
+                   st.seconds, st.avg_fill_percent);
+    }
 }
 #else
-static bool audio_open(unsigned rate) { (void) rate; return false; }
-static bool audio_flush(void) { audio_buf_frames = 0; return false; }
+static bool audio_open(unsigned rate) { (void) resample_init(rate); return false; }
+static bool audio_flush(void) {
+    if (device_rate != core_rate && audio_buf_frames) resample_audio();
+    audio_buf_frames = 0;
+    return false;
+}
+static bool audio_silence(void) { return false; }
 static void audio_close(void) {}
 #endif
 
@@ -223,8 +467,11 @@ static int fb_fd = -1;
 static uint8_t * fb_mem;
 static size_t fb_len;
 static struct fb_var_screeninfo vinfo, vinfo_orig;
-static int fb_page;                  /* page being drawn into */
+static int fb_page;                  /* page the presenter writes next (the one not on screen) */
 static int fb_pages;
+static present_t presenter;
+static bool presenting;              /* the presenter thread runs: all framebuffer writes go through it */
+static uint64_t pan_ns_total, pan_ns_max, copy_ns_total; /* written by the presenter thread, read after it stopped */
 
 static uint16_t * fb_page_ptr(int page) {
     return (uint16_t *) (fb_mem + (size_t) page * vinfo.yres * surf_stride * 2);
@@ -237,7 +484,7 @@ static bool fb_open(void) {
         runner_log("fb0: %s", strerror(errno));
         return false;
     }
-    if (vinfo.bits_per_pixel != 16 || vinfo.xres > MAX_SURFACE_WIDTH) {
+    if (vinfo.bits_per_pixel != 16 || vinfo.xres > MAX_SURFACE_WIDTH || vinfo.yres > MAX_SURFACE_HEIGHT) {
         runner_log("fb0: unsupported mode %ux%u at %u bpp", vinfo.xres, vinfo.yres, vinfo.bits_per_pixel);
         return false;
     }
@@ -256,17 +503,57 @@ static bool fb_open(void) {
     if (fb_pages < 1) fb_pages = 1;
     if (fb_pages > 2) fb_pages = 2;
     fb_page = (fb_pages > 1 && vinfo.yoffset == 0) ? 1 : 0;
-    surf = fb_page_ptr(fb_page);
     return true;
 }
 
-/* Shows the page just drawn and starts drawing into the other one. */
-static void flip_page(void) {
-    if (fb_fd < 0 || fb_pages < 2) return;
+/* Presenter thread: copies a finished frame into the page that is not on screen
+ * and pans to it. The pan is where the wait for the display happens (see
+ * present.h). With a single page the copy goes straight to the screen. */
+static void fb_show(void * ctx, const uint16_t * px, int rows) {
+    (void) ctx;
+    uint64_t t0 = now_ns();
+    memcpy(fb_page_ptr(fb_page), px, ((size_t) (rows - 1) * (size_t) surf_stride + (size_t) surf_w) * 2);
+    uint64_t t1 = now_ns();
+    copy_ns_total += t1 - t0;
+    if (fb_pages < 2) return;
     vinfo.yoffset = (unsigned) (fb_page * vinfo.yres);
     ioctl(fb_fd, FBIOPAN_DISPLAY, &vinfo);
+    uint64_t dt = now_ns() - t1;
+    pan_ns_total += dt;
+    if (dt > pan_ns_max) pan_ns_max = dt;
     fb_page ^= 1;
-    surf = fb_page_ptr(fb_page);
+}
+
+/* Starts the presenter once the game area height limit is known. */
+static bool presenter_start(void) {
+    size_t bytes = (size_t) surf_stride * (size_t) max_game_h * 2;
+    if (fb_fd < 0 || !present_start(&presenter, bytes, fb_show, NULL)) return false;
+    presenting = true;
+    surf = present_buffer(&presenter);
+    return true;
+}
+
+/* video_cb finished a frame in surf: hand it to the presenter without waiting. */
+static void present_frame(void) {
+    if (!presenting) return;
+    present_submit(&presenter, game_h);
+    surf = present_buffer(&presenter);
+}
+
+/* Exclusive framebuffer access for the controls and the pause menu. */
+static void fb_claim(void) {
+    if (presenting) present_claim(&presenter);
+}
+
+static void fb_release(void) {
+    if (presenting) present_release(&presenter);
+}
+
+static void presenter_stop(void) {
+    if (!presenting) return;
+    present_stop(&presenter); /* the last frame submitted is shown first */
+    presenting = false;
+    surf = NULL;
 }
 
 /* Puts the page the player was showing back on screen. Also called by the
@@ -289,16 +576,22 @@ static void fb_close(void) {
  * The control area is every row below the scaled game. Sizes and positions
  * are fractions of the smaller side of that area, so the same layout fits
  * the 480x800, 480x720 and 320x480 panels. All coordinates here are local
- * to the control area. */
+ * to the control area. Which buttons exist comes from the emulator's
+ * "frontend" settings: face buttons A/B (and X/Y as a diamond) on the right,
+ * L and R as wide bars along the top edge, SELECT and START small at the
+ * bottom. The D-pad is always there. */
 
 #define COLOR_PANEL 0x18E3
 #define COLOR_DPAD 0x39E7
 #define COLOR_DPAD_ARM 0x6B4D
-#define COLOR_BUTTON_AB 0xA145
+#define COLOR_BUTTON_FACE 0xA145
 #define COLOR_BUTTON_META 0x6B4D
-#define COLOR_EXIT 0x8000
 #define COLOR_LABEL 0xFFFF
 #define COLOR_LABEL_DIM 0xC618
+
+#define MAX_FACE 4
+#define MAX_META 2
+#define MAX_BARS 2
 
 typedef struct {
     int cx, cy, r;
@@ -306,41 +599,108 @@ typedef struct {
     const char * label;
 } pad_button_t;
 
+typedef struct {
+    int x0, y0, x1, y1;
+    unsigned bit;
+    const char * label;
+} pad_bar_t;
+
 static struct {
     int top, w, h;                   /* control area on the screen */
     int dpad_cx, dpad_cy, dpad_r, dpad_arm, dpad_dead, dpad_reach;
-    pad_button_t buttons[4];         /* A, B, SELECT, START */
-    int button_reach, ab_scale, meta_scale, meta_label_dy;
-    int exit_x0, exit_y0, exit_x1, exit_y1;
+    pad_button_t face[MAX_FACE];     /* A, B, X, Y as configured */
+    int face_count;
+    pad_button_t meta[MAX_META];     /* SELECT, START as configured */
+    int meta_count;
+    pad_bar_t bars[MAX_BARS];        /* L, R */
+    int bar_count;
+    int button_reach, face_scale, meta_scale, bar_scale, meta_label_dy;
 } lay;
 
+static bool has_button(unsigned id) {
+    return (cfg.buttons >> id) & 1u;
+}
+
+/* Bits the pad reports to the core: the D-pad plus the configured buttons. */
+static uint16_t pad_mask(void) {
+    uint16_t m = (1u << RETRO_DEVICE_ID_JOYPAD_UP) | (1u << RETRO_DEVICE_ID_JOYPAD_DOWN) |
+                 (1u << RETRO_DEVICE_ID_JOYPAD_LEFT) | (1u << RETRO_DEVICE_ID_JOYPAD_RIGHT);
+    return (uint16_t) (m | cfg.buttons);
+}
+
+static int scale_for(int r, int divisor) {
+    return r / divisor > 1 ? r / divisor : 1;
+}
+
 static void layout_controls(int top) {
+    memset(&lay, 0, sizeof(lay));
     lay.top = top;
     lay.w = surf_w;
     lay.h = surf_h - top;
-    int m = lay.w < lay.h ? lay.w : lay.h;
+    /* The smaller side, but at most 85% of the width so the D-pad circle (a quarter of
+     * the width from the left edge) stays on screen when the control area is tall. */
+    int m = lay.w * 85 / 100 < lay.h ? lay.w * 85 / 100 : lay.h;
     lay.dpad_r = m * 28 / 100;
     lay.dpad_cx = lay.w / 4;
     lay.dpad_cy = lay.h * 46 / 100;
     lay.dpad_arm = lay.dpad_r * 29 / 100;
     lay.dpad_dead = m * 5 / 100;
     lay.dpad_reach = lay.dpad_r + m * 8 / 100;
-    int ab_r = m * 13 / 100;
-    int meta_r = m * 85 / 1000;
     lay.button_reach = m * 4 / 100;
-    lay.ab_scale = ab_r / 8 > 1 ? ab_r / 8 : 1;
+
+    bool diamond = has_button(RETRO_DEVICE_ID_JOYPAD_X) || has_button(RETRO_DEVICE_ID_JOYPAD_Y);
+    int face_r = diamond ? m * 10 / 100 : m * 13 / 100;
+    lay.face_scale = scale_for(face_r, 8);
+    if (diamond) {
+        /* SNES positions: Y left, X top, A right, B bottom. */
+        int cx = lay.w * 73 / 100, cy = lay.dpad_cy, d = m * 17 / 100;
+        static const struct { unsigned bit; int dx, dy; const char * label; } slots[] = {
+            { RETRO_DEVICE_ID_JOYPAD_Y, -1, 0, "Y" }, { RETRO_DEVICE_ID_JOYPAD_X, 0, -1, "X" },
+            { RETRO_DEVICE_ID_JOYPAD_A, 1, 0, "A" },  { RETRO_DEVICE_ID_JOYPAD_B, 0, 1, "B" },
+        };
+        for (size_t i = 0; i < sizeof(slots) / sizeof(slots[0]); i++)
+            if (has_button(slots[i].bit))
+                lay.face[lay.face_count++] = (pad_button_t) { cx + slots[i].dx * d, cy + slots[i].dy * d, face_r,
+                                                              slots[i].bit, slots[i].label };
+    } else {
+        bool a = has_button(RETRO_DEVICE_ID_JOYPAD_A), b = has_button(RETRO_DEVICE_ID_JOYPAD_B);
+        if (a)
+            lay.face[lay.face_count++] = (pad_button_t) { a && b ? lay.w * 855 / 1000 : lay.w * 74 / 100,
+                                                          a && b ? lay.dpad_cy - m * 10 / 100 : lay.dpad_cy,
+                                                          face_r, RETRO_DEVICE_ID_JOYPAD_A, "A" };
+        if (b)
+            lay.face[lay.face_count++] = (pad_button_t) { a && b ? lay.w * 625 / 1000 : lay.w * 74 / 100,
+                                                          a && b ? lay.dpad_cy + m * 10 / 100 : lay.dpad_cy,
+                                                          face_r, RETRO_DEVICE_ID_JOYPAD_B, "B" };
+    }
+
+    int meta_r = m * 85 / 1000;
     lay.meta_scale = (m + 50) / 150;
     lay.meta_label_dy = meta_r + m * 4 / 100 + 7 * lay.meta_scale / 2;
     int meta_cy = lay.h - meta_r - m * 5 / 100;
-    lay.buttons[0] = (pad_button_t) { lay.w * 855 / 1000, lay.dpad_cy - m * 10 / 100, ab_r, RETRO_DEVICE_ID_JOYPAD_A, "A" };
-    lay.buttons[1] = (pad_button_t) { lay.w * 625 / 1000, lay.dpad_cy + m * 10 / 100, ab_r, RETRO_DEVICE_ID_JOYPAD_B, "B" };
-    lay.buttons[2] = (pad_button_t) { lay.w / 2 - lay.w * 104 / 1000, meta_cy, meta_r, RETRO_DEVICE_ID_JOYPAD_SELECT, "SELECT" };
-    lay.buttons[3] = (pad_button_t) { lay.w / 2 + lay.w * 104 / 1000, meta_cy, meta_r, RETRO_DEVICE_ID_JOYPAD_START, "START" };
-    int exit_size = m * 17 / 100, gap = m * 12 / 1000 + 2;
-    lay.exit_x1 = lay.w - gap;
-    lay.exit_x0 = lay.exit_x1 - exit_size;
-    lay.exit_y0 = gap;
-    lay.exit_y1 = gap + exit_size;
+    bool sel = has_button(RETRO_DEVICE_ID_JOYPAD_SELECT), sta = has_button(RETRO_DEVICE_ID_JOYPAD_START);
+    int meta_dx = sel && sta ? lay.w * 104 / 1000 : 0;
+    if (sel && sta) {
+        /* Half of each label plus one character cell of gap must fit between
+         * the two centers, or the labels run into each other. */
+        int half_widths = ((6 + 5) * GLYPH5X7_CELL_W - 2 * GLYPH5X7_SPACING) / 2;
+        int fit = meta_dx * 2 / (half_widths + GLYPH5X7_CELL_W);
+        if (fit < lay.meta_scale) lay.meta_scale = fit > 1 ? fit : 1;
+        lay.meta_label_dy = meta_r + m * 4 / 100 + 7 * lay.meta_scale / 2;
+    }
+    if (sel)
+        lay.meta[lay.meta_count++] = (pad_button_t) { lay.w / 2 - meta_dx, meta_cy, meta_r,
+                                                      RETRO_DEVICE_ID_JOYPAD_SELECT, "SELECT" };
+    if (sta)
+        lay.meta[lay.meta_count++] = (pad_button_t) { lay.w / 2 + meta_dx, meta_cy, meta_r,
+                                                      RETRO_DEVICE_ID_JOYPAD_START, "START" };
+
+    int gap = m * 12 / 1000 + 2, bar_h = m * 12 / 100;
+    lay.bar_scale = scale_for(bar_h, 10);
+    if (has_button(RETRO_DEVICE_ID_JOYPAD_L))
+        lay.bars[lay.bar_count++] = (pad_bar_t) { gap, gap, lay.w * 42 / 100, gap + bar_h, RETRO_DEVICE_ID_JOYPAD_L, "L" };
+    if (has_button(RETRO_DEVICE_ID_JOYPAD_R))
+        lay.bars[lay.bar_count++] = (pad_bar_t) { lay.w * 58 / 100, gap, lay.w - gap, gap + bar_h, RETRO_DEVICE_ID_JOYPAD_R, "R" };
 }
 
 typedef struct {
@@ -382,20 +742,26 @@ static void render_controls(canvas_t * c) {
               lay.dpad_cx + lay.dpad_arm, lay.dpad_cy + lay.dpad_r - inset, COLOR_DPAD_ARM);
     fill_rect(c, lay.dpad_cx - lay.dpad_r + inset, lay.dpad_cy - lay.dpad_arm,
               lay.dpad_cx + lay.dpad_r - inset, lay.dpad_cy + lay.dpad_arm, COLOR_DPAD_ARM);
-    for (int i = 0; i < 4; i++)
-        fill_circle(c, lay.buttons[i].cx, lay.buttons[i].cy, lay.buttons[i].r, i < 2 ? COLOR_BUTTON_AB : COLOR_BUTTON_META);
-    fill_rect(c, lay.exit_x0, lay.exit_y0, lay.exit_x1, lay.exit_y1, COLOR_EXIT);
-    for (int i = 0; i < 2; i++)
-        draw_text(c, lay.buttons[i].cx, lay.buttons[i].cy, lay.buttons[i].label, lay.ab_scale, COLOR_LABEL);
-    for (int i = 2; i < 4; i++)
-        draw_text(c, lay.buttons[i].cx, lay.buttons[i].cy - lay.meta_label_dy, lay.buttons[i].label,
+    for (int i = 0; i < lay.face_count; i++)
+        fill_circle(c, lay.face[i].cx, lay.face[i].cy, lay.face[i].r, COLOR_BUTTON_FACE);
+    for (int i = 0; i < lay.meta_count; i++)
+        fill_circle(c, lay.meta[i].cx, lay.meta[i].cy, lay.meta[i].r, COLOR_BUTTON_META);
+    for (int i = 0; i < lay.bar_count; i++) {
+        const pad_bar_t * b = &lay.bars[i];
+        fill_rect(c, b->x0, b->y0, b->x1, b->y1, COLOR_BUTTON_META);
+        draw_text(c, (b->x0 + b->x1) / 2, (b->y0 + b->y1) / 2, b->label, lay.bar_scale, COLOR_LABEL);
+    }
+    for (int i = 0; i < lay.face_count; i++)
+        draw_text(c, lay.face[i].cx, lay.face[i].cy, lay.face[i].label, lay.face_scale, COLOR_LABEL);
+    for (int i = 0; i < lay.meta_count; i++)
+        draw_text(c, lay.meta[i].cx, lay.meta[i].cy - lay.meta_label_dy, lay.meta[i].label,
                   lay.meta_scale, COLOR_LABEL_DIM);
-    draw_text(c, (lay.exit_x0 + lay.exit_x1) / 2, (lay.exit_y0 + lay.exit_y1) / 2, "EXIT", lay.meta_scale, COLOR_LABEL);
 }
 
-/* Paints both pages: black above the game's rows, the controls below. The
- * controls are composed once in RAM and copied a row at a time. */
-static bool draw_screen(void) {
+/* Paints both pages: the game's rows above (black, or the saved frame when
+ * the pause menu closes), the controls below. The controls are composed once
+ * in RAM and copied a row at a time. */
+static bool draw_screen(bool restore_game) {
     canvas_t c = { malloc((size_t) lay.w * lay.h * 2), lay.w, lay.h };
     uint16_t * black = calloc((size_t) surf_w, 2);
     if (!c.px || !black) {
@@ -404,24 +770,36 @@ static bool draw_screen(void) {
         return false;
     }
     render_controls(&c);
+    bool game = restore_game && shadow && shadow_rows == lay.top;
+    fb_claim();
     for (int page = 0; page < fb_pages; page++) {
         uint16_t * p = fb_page_ptr(page);
-        for (int y = 0; y < lay.top; y++) memcpy(p + (size_t) y * surf_stride, black, (size_t) surf_w * 2);
+        for (int y = 0; y < lay.top; y++)
+            memcpy(p + (size_t) y * surf_stride, game ? shadow + (size_t) y * surf_w : black, (size_t) surf_w * 2);
         for (int y = 0; y < lay.h; y++)
             memcpy(p + (size_t) (lay.top + y) * surf_stride, c.px + (size_t) y * c.w, (size_t) c.w * 2);
     }
+    fb_release();
     free(c.px);
     free(black);
     return true;
+}
+
+/* The game area changed height: move the controls to match. */
+static void relayout_for_game(void) {
+    if (fb_fd < 0) return;
+    layout_controls(game_h);
+    if (!draw_screen(false)) runner_log("out of memory");
 }
 
 /* Joypad bits pressed by one contact at screen position (x, y). */
 static uint16_t touch_bits(int x, int y) {
     y -= lay.top;
     if (y < 0) return 0;
-    if (x >= lay.exit_x0 && x < lay.exit_x1 && y >= lay.exit_y0 && y < lay.exit_y1) {
-        quit_flag = 1;
-        return 0;
+    for (int i = 0; i < lay.bar_count; i++) {
+        const pad_bar_t * b = &lay.bars[i];
+        int g = lay.button_reach;
+        if (x >= b->x0 - g && x < b->x1 + g && y >= b->y0 - g && y < b->y1 + g) return (uint16_t) (1u << b->bit);
     }
     int dx = x - lay.dpad_cx, dy = y - lay.dpad_cy;
     if (dx * dx + dy * dy <= lay.dpad_reach * lay.dpad_reach) {
@@ -433,11 +811,18 @@ static uint16_t touch_bits(int x, int y) {
         if (ay * 5 >= ax * 2) bits |= 1u << (dy < 0 ? RETRO_DEVICE_ID_JOYPAD_UP : RETRO_DEVICE_ID_JOYPAD_DOWN);
         return bits;
     }
-    for (int i = 0; i < 4; i++) {
-        int bx = x - lay.buttons[i].cx, by = y - lay.buttons[i].cy, r = lay.buttons[i].r + lay.button_reach;
-        if (bx * bx + by * by <= r * r) return (uint16_t) (1u << lay.buttons[i].bit);
+    /* Round buttons: the nearest one whose reach covers the contact. */
+    const pad_button_t * best = NULL;
+    int best_d2 = 0;
+    for (int i = 0; i < lay.face_count + lay.meta_count; i++) {
+        const pad_button_t * b = i < lay.face_count ? &lay.face[i] : &lay.meta[i - lay.face_count];
+        int bx = x - b->cx, by = y - b->cy, r = b->r + lay.button_reach, d2 = bx * bx + by * by;
+        if (d2 <= r * r && (!best || d2 < best_d2)) {
+            best = b;
+            best_d2 = d2;
+        }
     }
-    return 0;
+    return best ? (uint16_t) (1u << best->bit) : 0;
 }
 
 /* ---- input ---- */
@@ -472,6 +857,8 @@ static input_dev_t devs[MAX_INPUT_DEVICES];
 static int dev_count;
 static uint16_t pad_bits;            /* RETRO_DEVICE_ID_JOYPAD_* bitmask */
 static uint16_t key_pad_bits;
+static bool menu_open;               /* the pause menu is up: the core is not running, no bits reach it */
+static bool power_tap;               /* KEY_POWER was pressed and released before the quit hold */
 static unsigned char keys_down[(BTN_MISC + 7) / 8];
 static int keys_down_count;
 static uint64_t power_down_ns;
@@ -490,13 +877,21 @@ static bool bit_set(const unsigned long * bits, int n) {
     return (bits[n / (8 * sizeof(long))] >> (n % (8 * sizeof(long)))) & 1;
 }
 
+/* Physical keys. Volume up/down are A/B and play/pause is START whatever the
+ * core. Previous and next are SELECT and A by default (the NES layout); with
+ * L/R buttons they become L and R (SELECT stays on the touch screen), and with
+ * X/Y buttons but no L/R, next becomes X. A key whose button the emulator does
+ * not have does nothing. The power key is the pause menu (and quit on a hold). */
 static int key_to_pad_bit(int code) {
+    bool shoulders = has_button(RETRO_DEVICE_ID_JOYPAD_L) || has_button(RETRO_DEVICE_ID_JOYPAD_R);
+    bool extra_face = has_button(RETRO_DEVICE_ID_JOYPAD_X) || has_button(RETRO_DEVICE_ID_JOYPAD_Y);
     switch (code) {
         case KEY_VOLUMEUP: return RETRO_DEVICE_ID_JOYPAD_A;
         case KEY_VOLUMEDOWN: return RETRO_DEVICE_ID_JOYPAD_B;
         case KEY_PLAYPAUSE: return RETRO_DEVICE_ID_JOYPAD_START;
-        case KEY_PREVIOUSSONG: return RETRO_DEVICE_ID_JOYPAD_SELECT;
-        case KEY_NEXTSONG: return RETRO_DEVICE_ID_JOYPAD_A;
+        case KEY_PREVIOUSSONG: return shoulders ? RETRO_DEVICE_ID_JOYPAD_L : RETRO_DEVICE_ID_JOYPAD_SELECT;
+        case KEY_NEXTSONG:
+            return shoulders ? RETRO_DEVICE_ID_JOYPAD_R : extra_face ? RETRO_DEVICE_ID_JOYPAD_X : RETRO_DEVICE_ID_JOYPAD_A;
         default: return -1;
     }
 }
@@ -579,7 +974,11 @@ static int scale_axis(const input_dev_t * d, int v, const struct input_absinfo *
 }
 
 static void recompute_pad(void) {
-    uint16_t bits = key_pad_bits;
+    if (menu_open) {
+        pad_bits = 0;
+        return;
+    }
+    uint16_t bits = key_pad_bits & pad_mask();
     for (int i = 0; i < dev_count; i++)
         for (int j = 0; j < MAX_CONTACTS; j++) {
             const contact_t * c = &devs[i].contacts[j];
@@ -597,8 +996,25 @@ static void handle_key(input_dev_t * d, const struct input_event * ev) {
         return;
     }
     if (ev->code == KEY_POWER) {
-        if (ev->value == 1) power_down_ns = now_ns();
-        else if (ev->value == 0) power_down_ns = 0;
+        /* The hold is measured between the events' own timestamps: a core
+         * frame that stalls past the release would otherwise read the press
+         * and release together and turn a quit hold into a tap. */
+        static uint64_t power_press_ev_us;
+#ifdef input_event_sec
+        uint64_t ev_us = (uint64_t) ev->input_event_sec * 1000000u + (uint64_t) ev->input_event_usec;
+#else
+        uint64_t ev_us = (uint64_t) ev->time.tv_sec * 1000000u + (uint64_t) ev->time.tv_usec;
+#endif
+        if (ev->value == 1) {
+            power_down_ns = now_ns();
+            power_press_ev_us = ev_us;
+        } else if (ev->value == 0) {
+            if (power_down_ns && power_press_ev_us && ev_us >= power_press_ev_us &&
+                (ev_us - power_press_ev_us) * 1000u >= POWER_HOLD_QUIT_NS) quit_flag = 1;
+            else if (power_down_ns && now_ns() - power_down_ns < POWER_HOLD_QUIT_NS) power_tap = true;
+            power_down_ns = 0;
+            power_press_ev_us = 0;
+        }
     }
     if (ev->code < BTN_MISC && ev->value != 2) {
         unsigned char mask = (unsigned char) (1u << (ev->code % 8));
@@ -714,6 +1130,62 @@ static void handle_event(input_dev_t * d, const struct input_event * ev) {
     }
 }
 
+/* ---- touch gestures ----
+ *
+ * Every touch from the first finger down to the last finger up is one
+ * gesture. The pause menu opens on a tap (a short, nearly motionless single
+ * touch) in the middle of the game area, and its rows react to a touch that
+ * starts and ends in the same row. */
+
+typedef struct {
+    bool active, ignore;             /* ignore: a touch already down at start-up never counts */
+    uint64_t t0_ns;
+    int x0, y0, x, y;                /* start and latest position of the first contact */
+    int max_d2, max_contacts;
+} gesture_t;
+
+typedef struct {
+    bool done;                       /* a gesture ended since it was last consumed */
+    bool tap;                        /* it was short, nearly still and single-finger */
+    int x0, y0, x, y;
+} gesture_result_t;
+
+static gesture_t gesture;
+static gesture_result_t gesture_result;
+
+static void track_gesture(void) {
+    int n = 0, x = 0, y = 0;
+    for (int i = 0; i < dev_count; i++)
+        for (int j = 0; j < MAX_CONTACTS; j++) {
+            const contact_t * c = &devs[i].contacts[j];
+            if (c->id < 0) continue;
+            if (!n++) {
+                x = scale_axis(&devs[i], c->x, &devs[i].abs_x, surf_w);
+                y = scale_axis(&devs[i], c->y, &devs[i].abs_y, surf_h);
+            }
+        }
+    uint64_t now = now_ns();
+    if (n > 0 && !gesture.active) {
+        gesture = (gesture_t) { .active = true, .ignore = gesture.ignore, .t0_ns = now, .x0 = x, .y0 = y, .x = x, .y = y,
+                                .max_contacts = n };
+    } else if (n > 0) {
+        int dx = x - gesture.x0, dy = y - gesture.y0;
+        gesture.x = x;
+        gesture.y = y;
+        if (dx * dx + dy * dy > gesture.max_d2) gesture.max_d2 = dx * dx + dy * dy;
+        if (n > gesture.max_contacts) gesture.max_contacts = n;
+    } else if (gesture.active) {
+        if (!gesture.ignore)
+            gesture_result = (gesture_result_t) {
+                .done = true,
+                .tap = now - gesture.t0_ns <= TAP_MAX_NS && gesture.max_d2 <= TAP_MAX_MOVE_PX * TAP_MAX_MOVE_PX &&
+                       gesture.max_contacts == 1,
+                .x0 = gesture.x0, .y0 = gesture.y0, .x = gesture.x, .y = gesture.y,
+            };
+        gesture.active = gesture.ignore = false;
+    }
+}
+
 /* Drains every device and refreshes pad_bits; requests quit on a power hold. */
 static void input_pump(void) {
     if (power_down_ns && now_ns() - power_down_ns >= POWER_HOLD_QUIT_NS) quit_flag = 1;
@@ -722,6 +1194,7 @@ static void input_pump(void) {
     expire_type_a_contacts();
     if (!dev_count || poll(pfds, (nfds_t) dev_count, 0) <= 0) {
         recompute_pad();
+        track_gesture();
         return;
     }
     for (int i = 0; i < dev_count; i++) {
@@ -738,6 +1211,7 @@ static void input_pump(void) {
         }
     }
     recompute_pad();
+    track_gesture();
 }
 
 /* Release events must reach this process, not the player: keep reading
@@ -765,6 +1239,46 @@ static void core_log(enum retro_log_level level, const char * fmt, ...) {
     runner_log("core: %s", line);
 }
 
+/* ---- frame skipping ----
+ *
+ * With "frameskip" set, the video of some frames is dropped: video_cb returns
+ * at once and the core is told (GET_AUDIO_VIDEO_ENABLE) so it can skip drawing
+ * if it supports that. A core that does not can still be given cheaper option
+ * answers for those frames ("skip_options"). The audio of every frame is kept. */
+
+static bool skip_pending;                /* the next frame's video is skipped */
+
+static void set_video_skip(bool skip) {
+    if (skip == video_skip) return;
+    video_skip = skip;
+    if (cfg.skip_option_count) variables_dirty = true;
+}
+
+/* Called before each retro_run. */
+static void frameskip_begin(void) {
+    set_video_skip(cfg.frameskip != FRAMESKIP_OFF && skip_pending);
+}
+
+/* Called after each retro_run with the time it took and the frame budget. */
+static void frameskip_end(uint64_t run_ns, uint64_t budget_ns) {
+    bool was_skipped = video_skip;
+    if (cfg.frameskip == FRAMESKIP_AUTO) skip_pending = !was_skipped && run_ns > budget_ns;
+    else if (cfg.frameskip == FRAMESKIP_HALF) skip_pending = !was_skipped;
+    else skip_pending = false;
+}
+
+/* Runs that must show their frame (the pause menu capture, state checks). */
+static void frameskip_suspend(void) {
+    skip_pending = false;
+    set_video_skip(false);
+}
+
+/* RETRO_AV_ENABLE_VIDEO and _AUDIO; the enum is missing from older libretro.h copies. */
+#define AV_ENABLE_VIDEO 1
+#define AV_ENABLE_AUDIO 2
+
+static bool av_pending;                /* SET_SYSTEM_AV_INFO arrived: the main loop re-reads timing */
+
 static bool env_cb(unsigned cmd, void * data) {
     switch (cmd) {
         case RETRO_ENVIRONMENT_SET_PIXEL_FORMAT: {
@@ -775,6 +1289,9 @@ static bool env_cb(unsigned cmd, void * data) {
             return true;
         }
         case RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY:
+        case RETRO_ENVIRONMENT_GET_CORE_ASSETS_DIRECTORY:
+            *(const char **) data = emu_dir;
+            return true;
         case RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY:
             *(const char **) data = save_dir;
             return true;
@@ -784,10 +1301,45 @@ static bool env_cb(unsigned cmd, void * data) {
         case RETRO_ENVIRONMENT_GET_CAN_DUPE:
             *(bool *) data = true;
             return true;
+        case RETRO_ENVIRONMENT_GET_VARIABLE: {
+            struct retro_variable * var = data;
+            const char * value = NULL;
+            if (var && var->key) {
+                if (video_skip) value = frontend_config_skip_option(&cfg, var->key);
+                if (!value) value = frontend_config_option(&cfg, var->key);
+            }
+            if (var) var->value = value;
+            return value != NULL; /* unknown keys: the core keeps its own default */
+        }
         case RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE:
-            *(bool *) data = false;
+            *(bool *) data = variables_dirty;
+            variables_dirty = false;
             return true;
         case RETRO_ENVIRONMENT_GET_INPUT_BITMASKS:
+            return true;
+        case RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE:
+            /* Only cores of emulators that use frameskip are told; the others see the call as unsupported. */
+            if (cfg.frameskip == FRAMESKIP_OFF) return false;
+            *(int *) data = AV_ENABLE_AUDIO | (video_skip ? 0 : AV_ENABLE_VIDEO);
+            return true;
+        case RETRO_ENVIRONMENT_SET_GEOMETRY:
+            return true; /* the next frame's size drives the layout */
+        case RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO:
+            av_pending = true;
+            return true;
+        /* Accepted and ignored: the frontend has no option menu, the answers
+         * come from emulator.json. */
+        case RETRO_ENVIRONMENT_SET_VARIABLES:
+        case RETRO_ENVIRONMENT_SET_CORE_OPTIONS:
+        case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_INTL:
+        case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2:
+        case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2_INTL:
+        case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY:
+        case RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS:
+        case RETRO_ENVIRONMENT_SET_CONTROLLER_INFO:
+        case RETRO_ENVIRONMENT_SET_PERFORMANCE_LEVEL:
+        case RETRO_ENVIRONMENT_SET_SERIALIZATION_QUIRKS:
+        case RETRO_ENVIRONMENT_SET_MINIMUM_AUDIO_LATENCY:
             return true;
         default:
             return false;
@@ -812,13 +1364,14 @@ static void * read_file(const char * path, size_t * len) {
     return buf;
 }
 
-static void sram_path(const char * rom, char * out, size_t size) {
+/* "<rom without extension><suffix>", next to the ROM. */
+static void save_path(const char * rom, const char * suffix, char * out, size_t size) {
     snprintf(out, size, "%s", rom);
     char * slash = strrchr(out, '/');
     char * dot = strrchr(out, '.');
     if (dot && (!slash || dot > slash)) *dot = '\0';
     size_t len = strlen(out);
-    snprintf(out + len, size - len, ".srm");
+    snprintf(out + len, size - len, "%s", suffix);
 }
 
 static void sram_load(const char * rom) {
@@ -826,7 +1379,7 @@ static void sram_load(const char * rom) {
     void * mem = retro_get_memory_data(RETRO_MEMORY_SAVE_RAM);
     if (!n || !mem) return;
     char path[640];
-    sram_path(rom, path, sizeof(path));
+    save_path(rom, ".srm", path, sizeof(path));
     FILE * f = fopen(path, "rb");
     if (!f) return;
     if (fread(mem, 1, n, f) != n) runner_log("sram: short read from %s", path);
@@ -834,24 +1387,63 @@ static void sram_load(const char * rom) {
 }
 
 /* Temp file plus rename, so a power loss never leaves a truncated save. */
-static void sram_save(const char * rom) {
-    size_t n = retro_get_memory_size(RETRO_MEMORY_SAVE_RAM);
-    const void * mem = retro_get_memory_data(RETRO_MEMORY_SAVE_RAM);
-    if (!n || !mem) return;
-    char path[640], tmp[648];
-    sram_path(rom, path, sizeof(path));
+static bool write_file_atomic(const char * path, const void * mem, size_t n) {
+    char tmp[648];
     snprintf(tmp, sizeof(tmp), "%s.tmp", path);
     FILE * f = fopen(tmp, "wb");
     if (!f) {
-        runner_log("sram: cannot write %s: %s", tmp, strerror(errno));
-        return;
+        runner_log("cannot write %s: %s", tmp, strerror(errno));
+        return false;
     }
     bool ok = fwrite(mem, 1, n, f) == n && fflush(f) == 0 && fsync(fileno(f)) == 0;
     ok = fclose(f) == 0 && ok;
     if (!ok || rename(tmp, path) != 0) {
-        runner_log("sram: saving %s failed", path);
+        runner_log("saving %s failed", path);
         unlink(tmp);
+        return false;
     }
+    return true;
+}
+
+static void sram_save(const char * rom) {
+    size_t n = retro_get_memory_size(RETRO_MEMORY_SAVE_RAM);
+    const void * mem = retro_get_memory_data(RETRO_MEMORY_SAVE_RAM);
+    if (!n || !mem) return;
+    char path[640];
+    save_path(rom, ".srm", path, sizeof(path));
+    write_file_atomic(path, mem, n);
+}
+
+/* One save state slot, "<rom without extension>.state". */
+static bool state_supported(void) {
+    return retro_serialize_size() > 0;
+}
+
+static bool state_exists(const char * rom) {
+    char path[640];
+    struct stat st;
+    save_path(rom, ".state", path, sizeof(path));
+    return stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+static bool state_save(const char * rom) {
+    size_t n = retro_serialize_size();
+    void * buf = n ? malloc(n) : NULL;
+    char path[640];
+    save_path(rom, ".state", path, sizeof(path));
+    bool ok = buf && retro_serialize(buf, n) && write_file_atomic(path, buf, n);
+    free(buf);
+    return ok;
+}
+
+static bool state_load(const char * rom) {
+    char path[640];
+    save_path(rom, ".state", path, sizeof(path));
+    size_t len;
+    void * buf = read_file(path, &len);
+    bool ok = buf && len == retro_serialize_size() && retro_unserialize(buf, len);
+    free(buf);
+    return ok;
 }
 
 static void core_start(void) {
@@ -887,6 +1479,7 @@ static bool core_load(const char * rom, struct retro_system_av_info * av, void *
         *rom_data = NULL;
         return false;
     }
+    variables_dirty = true;
     retro_get_system_av_info(av);
     runner_log("core %s %s: %ux%u @ %.3f fps, audio %.0f Hz, pixel format %d", si.library_name,
                si.library_version, av->geometry.base_width, av->geometry.base_height, av->timing.fps,
@@ -905,6 +1498,45 @@ static void set_save_dir(const char * rom) {
     char * slash = strrchr(save_dir, '/');
     if (slash) *slash = '\0';
     else strcpy(save_dir, ".");
+}
+
+/* ---- emulator settings ---- */
+
+static bool settings_loaded;
+
+static bool file_exists(const char * path) {
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+/* The player starts the emulator with its own folder as the working
+ * directory; run by hand from elsewhere, the folder of the executable is the
+ * fallback. That folder is the system directory and holds emulator.json. */
+static void load_settings(const char * argv0) {
+    char path[640];
+    settings_loaded = true;
+    frontend_config_default(&cfg);
+    if (!getcwd(emu_dir, sizeof(emu_dir))) snprintf(emu_dir, sizeof(emu_dir), ".");
+    snprintf(path, sizeof(path), "%s/emulator.json", emu_dir);
+    if (!file_exists(path) && argv0 && strrchr(argv0, '/')) {
+        char dir[512];
+        snprintf(dir, sizeof(dir), "%s", argv0);
+        *strrchr(dir, '/') = '\0';
+        snprintf(path, sizeof(path), "%s/emulator.json", dir[0] ? dir : "/");
+        if (file_exists(path)) snprintf(emu_dir, sizeof(emu_dir), "%s", dir[0] ? dir : "/");
+    }
+    size_t len;
+    char * json = read_file(path, &len);
+    if (!json) {
+        runner_log("no emulator.json in %s: default settings", emu_dir);
+        return;
+    }
+    char why[64];
+    if (!frontend_config_parse(json, len, &cfg, why, sizeof(why))) {
+        runner_log("emulator.json: %s: default settings", why);
+        frontend_config_default(&cfg);
+    }
+    free(json);
 }
 
 /* ---- headless benchmark ---- */
@@ -938,8 +1570,65 @@ static uint16_t bench_input(uint64_t frame) {
     return bits;
 }
 
+static uint32_t fnv1a(uint32_t h, const void * data, size_t n) {
+    const uint8_t * p = data;
+    for (size_t i = 0; i < n; i++) h = (h ^ p[i]) * 16777619u;
+    return h;
+}
+
+/* Runs a few frames after the timed ones and hashes what the core produced
+ * (its audio before resampling, then the last scaled picture), so builds with
+ * other compiler flags can be compared for identical output. Not timed. */
+#define BENCH_CHECK_FRAMES 30
+static void bench_check_frames(uint64_t first_frame, uint32_t * audio_hash, uint32_t * video_hash, int * peak) {
+    uint32_t ah = 2166136261u, vh = 2166136261u;
+    frameskip_suspend();
+    for (int i = 0; i < BENCH_CHECK_FRAMES; i++) {
+        pad_bits = bench_input(first_frame + (uint64_t) i);
+        retro_run();
+        ah = fnv1a(ah, audio_buf, audio_buf_frames * 4);
+        for (size_t k = 0; k < audio_buf_frames * 2; k++) {
+            int v = audio_buf[k] < 0 ? -audio_buf[k] : audio_buf[k];
+            if (v > *peak) *peak = v;
+        }
+        audio_flush();
+    }
+    for (int y = 0; y < game_h; y++) vh = fnv1a(vh, surf + (size_t) y * surf_stride, (size_t) surf_w * 2);
+    *audio_hash = ah;
+    *video_hash = vh;
+}
+
+/* Serialize, run on, unserialize, serialize again: the two states must be
+ * identical. 1 = round trip works, 0 = it does not, -1 = no state support. */
+static int state_roundtrip_check(uint64_t first_frame, size_t * size) {
+    *size = retro_serialize_size();
+    if (!*size) return -1;
+    void * a = malloc(*size);
+    void * b = malloc(*size);
+    bool ok = a && b && retro_serialize(a, *size);
+    for (int i = 0; ok && i < 30; i++) {
+        pad_bits = bench_input(first_frame + (uint64_t) i);
+        retro_run();
+        audio_flush();
+    }
+    ok = ok && retro_unserialize(a, *size) && retro_serialize(b, *size);
+    if (ok && memcmp(a, b, *size) != 0) {
+        size_t first = 0, differing = 0;
+        for (size_t i = 0; i < *size; i++)
+            if (((const uint8_t *) a)[i] != ((const uint8_t *) b)[i] && !differing++) first = i;
+        runner_log("state differs after a round trip: %zu bytes, first at offset %zu", differing, first);
+        ok = false;
+    }
+    free(a);
+    free(b);
+    return ok ? 1 : 0;
+}
+
+static uint64_t bench_budget_ns;     /* --budget-ms: pretend a slower device for the frameskip policy */
+
 bool frontend_bench(const char * rom, long frames, frontend_bench_t * out) {
     memset(out, 0, sizeof(*out));
+    if (!settings_loaded) load_settings(NULL);
     set_save_dir(rom);
     core_start();
     struct retro_system_av_info av;
@@ -948,31 +1637,45 @@ bool frontend_bench(const char * rom, long frames, frontend_bench_t * out) {
         retro_deinit();
         return false;
     }
+    (void) resample_init((unsigned) (av.timing.sample_rate + 0.5)); /* the resampler is part of the cost */
     surf_w = 480;
     surf_h = 800;
     surf_stride = 480;
-    max_game_h = surf_h;
+    max_game_h = surf_h * MAX_GAME_PERCENT / 100;
     surf = calloc((size_t) surf_stride * surf_h, 2);
-    uint64_t t_start = now_ns();
+    uint64_t budget_ns = bench_budget_ns ? bench_budget_ns : (uint64_t) (1e9 / av.timing.fps);
+    uint64_t audio_ns = 0, t_start = now_ns();
     double c_start = cpu_seconds();
     for (long f = 0; f < frames; f++) {
         pad_bits = bench_input((uint64_t) f);
+        frameskip_begin();
+        uint64_t t0 = now_ns();
         retro_run();
+        uint64_t t1 = now_ns();
         audio_flush();
+        audio_ns += now_ns() - t1;
+        frameskip_end(t1 - t0, budget_ns);
     }
     out->wall_s = (double) (now_ns() - t_start) / 1e9;
+    out->audio_s = (double) audio_ns / 1e9;
+    out->scale_s = (double) scale_ns_total / 1e9;
+    frameskip_suspend();
     out->cpu_s = cpu_seconds() - c_start;
     out->width = last_src_w;
     out->height = last_src_h;
-    out->scaled_width = surf_w;
+    out->scaled_width = draw_w;
     out->scaled_height = game_h;
     out->sample_rate = av.timing.sample_rate;
     out->fps = av.timing.fps;
     out->frames = (uint64_t) frames;
     out->video_frames = video_frames;
+    out->video_skipped = video_skipped;
     out->audio_frames = audio_frames_total;
     out->vm_hwm_kb = status_kb("VmHWM");
     out->sram_size = retro_get_memory_size(RETRO_MEMORY_SAVE_RAM);
+    out->audio_peak = 0;
+    bench_check_frames((uint64_t) frames, &out->audio_hash, &out->video_hash, &out->audio_peak);
+    out->state_roundtrip = state_roundtrip_check((uint64_t) frames + BENCH_CHECK_FRAMES, &out->state_size);
     core_stop(rom_data);
     free(surf);
     surf = NULL;
@@ -990,7 +1693,346 @@ static int run_bench(const char * rom, long frames) {
            (double) r.audio_frames / ((double) frames / r.fps), r.sample_rate);
     printf("video %ux%u scaled to %dx%d  VmHWM %ld kB\n", r.width, r.height, r.scaled_width, r.scaled_height,
            r.vm_hwm_kb);
+    printf("rendered %llu of %ld frames (video skipped on %llu)  audio resampling avg %.2f ms\n",
+           (unsigned long long) r.video_frames, frames, (unsigned long long) r.video_skipped,
+           r.audio_s * 1000 / frames);
+    printf("output check: audio %08x video %08x, audio peak %d\n", r.audio_hash, r.video_hash, r.audio_peak);
+    printf("save RAM %zu bytes, state %zu bytes, state round trip %s\n", r.sram_size, r.state_size,
+           r.state_roundtrip > 0 ? "ok" : r.state_roundtrip == 0 ? "FAILED" : "unsupported");
     return 0;
+}
+
+/* ---- layout self-check ---- */
+
+/* Lays the controls out for a screen and a set of buttons and checks that
+ * everything fits inside the control area, nothing overlaps, and touching the
+ * middle of each control presses exactly that control. */
+bool frontend_layout_check(int width, int height, int game_height, uint32_t buttons, char * error, size_t error_size) {
+    int saved_w = surf_w, saved_h = surf_h;
+    frontend_config_t saved_cfg = cfg;
+    surf_w = width;
+    surf_h = height;
+    cfg.buttons = buttons;
+    layout_controls(game_height);
+    const char * why = NULL;
+    char detail[96] = "";
+
+    /* Each control is a circle (r > 0) or a rectangle (r == 0). */
+    typedef struct { int x0, y0, x1, y1, r; } shape_t;
+    shape_t shapes[1 + MAX_FACE + MAX_META + MAX_BARS];
+    unsigned bits[1 + MAX_FACE + MAX_META + MAX_BARS];
+    const char * names[1 + MAX_FACE + MAX_META + MAX_BARS];
+    int n = 0;
+    shapes[n] = (shape_t) { lay.dpad_cx - lay.dpad_r, lay.dpad_cy - lay.dpad_r, lay.dpad_cx + lay.dpad_r, lay.dpad_cy + lay.dpad_r, lay.dpad_r };
+    bits[n] = 99;
+    names[n++] = "D-pad";
+    for (int i = 0; i < lay.face_count + lay.meta_count; i++, n++) {
+        const pad_button_t * b = i < lay.face_count ? &lay.face[i] : &lay.meta[i - lay.face_count];
+        shapes[n] = (shape_t) { b->cx - b->r, b->cy - b->r, b->cx + b->r, b->cy + b->r, b->r };
+        bits[n] = b->bit;
+        names[n] = b->label;
+    }
+    for (int i = 0; i < lay.bar_count; i++, n++) {
+        const pad_bar_t * b = &lay.bars[i];
+        shapes[n] = (shape_t) { b->x0, b->y0, b->x1, b->y1, 0 };
+        bits[n] = b->bit;
+        names[n] = b->label;
+    }
+    for (int i = 0; !why && i < n; i++) {
+        if (shapes[i].x0 < 0 || shapes[i].y0 < 0 || shapes[i].x1 > lay.w || shapes[i].y1 > lay.h) {
+            why = "outside the control area";
+            snprintf(detail, sizeof(detail), "%s", names[i]);
+        }
+        for (int j = i + 1; !why && j < n; j++) {
+            const shape_t *p = &shapes[i], *q = &shapes[j];
+            bool hit;
+            if (p->r && q->r) {
+                long dx = (p->x0 + p->x1) / 2 - (q->x0 + q->x1) / 2, dy = (p->y0 + p->y1) / 2 - (q->y0 + q->y1) / 2;
+                hit = dx * dx + dy * dy < (long) (p->r + q->r) * (p->r + q->r);
+            } else if (p->r || q->r) {
+                const shape_t * circle = p->r ? p : q;
+                const shape_t * rect = p->r ? q : p;
+                int cx = (circle->x0 + circle->x1) / 2, cy = (circle->y0 + circle->y1) / 2;
+                int nx = cx < rect->x0 ? rect->x0 : cx > rect->x1 ? rect->x1 : cx;
+                int ny = cy < rect->y0 ? rect->y0 : cy > rect->y1 ? rect->y1 : cy;
+                hit = (long) (cx - nx) * (cx - nx) + (long) (cy - ny) * (cy - ny) < (long) circle->r * circle->r;
+            } else {
+                hit = p->x0 < q->x1 && q->x0 < p->x1 && p->y0 < q->y1 && q->y0 < p->y1;
+            }
+            if (hit) {
+                why = "controls overlap";
+                snprintf(detail, sizeof(detail), "%s and %s", names[i], names[j]);
+            }
+        }
+    }
+    for (int i = 1; !why && i < n; i++) {
+        int cx = (shapes[i].x0 + shapes[i].x1) / 2, cy = (shapes[i].y0 + shapes[i].y1) / 2;
+        if (touch_bits(cx, cy + lay.top) != (uint16_t) (1u << bits[i])) {
+            why = "touching the middle of a control does not press it";
+            snprintf(detail, sizeof(detail), "%s", names[i]);
+        }
+    }
+    if (!why && touch_bits(lay.dpad_cx + lay.dpad_r * 6 / 10, lay.dpad_cy + lay.top) != (1u << RETRO_DEVICE_ID_JOYPAD_RIGHT)) {
+        why = "the D-pad right arm does not press RIGHT";
+    }
+    if (why && error && error_size) snprintf(error, error_size, "%dx%d game %d buttons 0x%x: %s %s", width, height, game_height, buttons, why, detail);
+    surf_w = saved_w;
+    surf_h = saved_h;
+    cfg = saved_cfg;
+    return !why;
+}
+
+/* ---- pause menu ----
+ *
+ * Opened by a tap in the middle of the game or a short press of the power
+ * key. While it is up the core does not run, joypad bits are cleared and the
+ * audio device gets silence, so nothing buzzes and the watchdog heartbeat
+ * keeps advancing. The game frame it opened over is dimmed behind the rows. */
+
+enum { ITEM_RESUME, ITEM_SAVE, ITEM_LOAD, ITEM_RESET, ITEM_EXIT, ITEM_COUNT };
+static const char * const item_label[ITEM_COUNT] = { "RESUME", "SAVE STATE", "LOAD STATE", "RESET", "EXIT" };
+
+#define MENU_STATUS_NS 1200000000ull
+#define COLOR_MENU_ROW 0x2965
+#define COLOR_MENU_EDGE 0x8410
+#define COLOR_MENU_OFF 0x5AEB
+
+static struct {
+    bool enabled[ITEM_COUNT];
+    int x0, x1, y0[ITEM_COUNT], row_h, scale;
+    int status_y;
+    char status[16];
+    uint64_t status_until_ns;
+} menu;
+
+static const char * current_rom;
+static bool resume_pending;            /* the main loop re-syncs its frame clock */
+
+static void dim_565(uint16_t * px, size_t n) {
+    for (size_t i = 0; i < n; i++) px[i] = (uint16_t) ((px[i] >> 1) & 0x7BEF);
+}
+
+static void menu_layout(void) {
+    menu.row_h = surf_h * 9 / 100;
+    int gap = surf_h * 15 / 1000 + 2;
+    int total = ITEM_COUNT * menu.row_h + (ITEM_COUNT - 1) * gap;
+    int top = (surf_h - total) / 2 - menu.row_h / 2;
+    if (top < gap) top = gap;
+    menu.x0 = surf_w * 15 / 100;
+    menu.x1 = surf_w - menu.x0;
+    for (int i = 0; i < ITEM_COUNT; i++) menu.y0[i] = top + i * (menu.row_h + gap);
+    menu.status_y = top + total + gap + menu.row_h / 2;
+    int by_height = menu.row_h * 55 / 100 / GLYPH5X7_ROWS;
+    int by_width = (menu.x1 - menu.x0) * 85 / 100 / (10 * GLYPH5X7_CELL_W - GLYPH5X7_SPACING);
+    menu.scale = by_height < by_width ? by_height : by_width;
+    if (menu.scale < 1) menu.scale = 1;
+}
+
+static void menu_refresh_items(void) {
+    bool states = state_supported();
+    menu.enabled[ITEM_RESUME] = menu.enabled[ITEM_RESET] = menu.enabled[ITEM_EXIT] = true;
+    menu.enabled[ITEM_SAVE] = states;
+    menu.enabled[ITEM_LOAD] = states && state_exists(current_rom);
+}
+
+static int menu_row_at(int x, int y) {
+    if (x < menu.x0 || x >= menu.x1) return -1;
+    for (int i = 0; i < ITEM_COUNT; i++)
+        if (y >= menu.y0[i] && y < menu.y0[i] + menu.row_h) return i;
+    return -1;
+}
+
+/* Draws the dimmed backdrop (the saved game frame and the controls) and the
+ * menu rows over it into a full-screen canvas. */
+static void menu_compose(canvas_t * cv) {
+    canvas_t c = *cv;
+    for (int y = 0; y < lay.top; y++) {
+        uint16_t * row = c.px + (size_t) y * surf_w;
+        if (shadow && y < shadow_rows) {
+            memcpy(row, shadow + (size_t) y * surf_w, (size_t) surf_w * 2);
+            dim_565(row, (size_t) surf_w);
+        } else {
+            memset(row, 0, (size_t) surf_w * 2);
+        }
+    }
+    canvas_t controls = { c.px + (size_t) lay.top * surf_w, surf_w, lay.h };
+    render_controls(&controls);
+    dim_565(controls.px, (size_t) surf_w * lay.h);
+    for (int i = 0; i < ITEM_COUNT; i++) {
+        int y0 = menu.y0[i], y1 = y0 + menu.row_h;
+        fill_rect(&c, menu.x0, y0, menu.x1, y1, COLOR_MENU_EDGE);
+        fill_rect(&c, menu.x0 + 2, y0 + 2, menu.x1 - 2, y1 - 2, COLOR_MENU_ROW);
+        draw_text(&c, (menu.x0 + menu.x1) / 2, (y0 + y1) / 2, item_label[i], menu.scale,
+                  menu.enabled[i] ? COLOR_LABEL : COLOR_MENU_OFF);
+    }
+    if (menu.status[0]) draw_text(&c, surf_w / 2, menu.status_y, menu.status, menu.scale, COLOR_LABEL);
+}
+
+/* Composes the whole screen in RAM and copies it to both pages. */
+static bool menu_render(void) {
+    canvas_t c = { malloc((size_t) surf_w * surf_h * 2), surf_w, surf_h };
+    if (!c.px) return false;
+    menu_compose(&c);
+    fb_claim();
+    for (int page = 0; page < fb_pages; page++) {
+        uint16_t * p = fb_page_ptr(page);
+        for (int y = 0; y < surf_h; y++) memcpy(p + (size_t) y * surf_stride, c.px + (size_t) y * surf_w, (size_t) surf_w * 2);
+    }
+    fb_release();
+    free(c.px);
+    return true;
+}
+
+static void menu_set_status(const char * text) {
+    snprintf(menu.status, sizeof(menu.status), "%s", text);
+    menu.status_until_ns = now_ns() + MENU_STATUS_NS;
+}
+
+/* Runs the core until a clean frame is kept for the dimmed backdrop, then
+ * shows the menu. (A frame the core duplicates is not delivered, so a couple
+ * of extra frames may run; nothing is shown meanwhile.) */
+static void menu_begin(void) {
+    shadow = malloc((size_t) surf_w * surf_h * 2);
+    if (!shadow) return;
+    shadow_rows = 0;
+    frameskip_suspend();
+    capture_frame = true;
+    for (int i = 0; i < 4 && !shadow_rows; i++) {
+        retro_run();
+        audio_flush();
+    }
+    capture_frame = false;
+    pad_bits = 0;
+    menu_layout();
+    menu_refresh_items();
+    menu.status[0] = '\0';
+    menu_open = true;
+    if (!menu_render()) menu_open = false;
+    if (!menu_open) {
+        free(shadow);
+        shadow = NULL;
+        shadow_rows = 0;
+    }
+}
+
+static void menu_close(void) {
+    menu_open = false;
+    resume_pending = true;
+    if (!draw_screen(true)) runner_log("out of memory");
+    free(shadow);
+    shadow = NULL;
+    shadow_rows = 0;
+}
+
+static void menu_activate(int item) {
+    switch (item) {
+        case ITEM_RESUME:
+            menu_close();
+            break;
+        case ITEM_SAVE:
+            menu_set_status(state_save(current_rom) ? "SAVED" : "FAILED");
+            menu_refresh_items();
+            menu_render();
+            break;
+        case ITEM_LOAD:
+            if (state_load(current_rom)) {
+                menu_close();
+            } else {
+                menu_set_status("FAILED");
+                menu_render();
+            }
+            break;
+        case ITEM_RESET:
+            retro_reset();
+            menu_close();
+            break;
+        case ITEM_EXIT:
+            quit_flag = 1;
+            break;
+    }
+}
+
+/* One pass of the paused loop: react to the power key and to touches, keep
+ * the audio device fed with silence. */
+static void menu_step(void) {
+    if (power_tap) {
+        power_tap = false;
+        menu_close();
+        return;
+    }
+    if (gesture_result.done) {
+        gesture_result_t g = gesture_result;
+        gesture_result.done = false;
+        int row = menu_row_at(g.x0, g.y0);
+        if (row >= 0 && row == menu_row_at(g.x, g.y) && menu.enabled[row]) {
+            menu_activate(row);
+            return;
+        }
+    }
+    if (menu.status[0] && now_ns() >= menu.status_until_ns) {
+        menu.status[0] = '\0';
+        menu_render();
+    }
+    if (!audio_silence()) usleep(16000);
+}
+
+/* A short, still, single-finger touch in the middle third of the game area. */
+static bool tap_in_game_center(const gesture_result_t * g) {
+    if (!g->tap || lay.top <= 0) return false;
+    int x_lo = surf_w / 3, x_hi = surf_w * 2 / 3, y_lo = lay.top / 3, y_hi = lay.top * 2 / 3;
+    return g->x0 >= x_lo && g->x0 < x_hi && g->y0 >= y_lo && g->y0 < y_hi;
+}
+
+/* Writes the touch layout, or the pause menu over it, for a screen size to a
+ * PPM file, so the drawing can be looked at without a device. The game area is
+ * a flat grey stand-in. */
+bool frontend_preview(int width, int height, int game_height, uint32_t buttons, bool with_menu, const char * ppm_path) {
+    int saved_w = surf_w, saved_h = surf_h;
+    frontend_config_t saved_cfg = cfg;
+    surf_w = width;
+    surf_h = height;
+    cfg.buttons = buttons;
+    layout_controls(game_height);
+    canvas_t c = { calloc((size_t) width * height, 2), width, height };
+    bool ok = c.px != NULL;
+    if (ok) {
+        canvas_t controls = { c.px + (size_t) lay.top * width, width, lay.h };
+        for (int y = 0; y < lay.top; y++)
+            for (int x = 0; x < width; x++) c.px[(size_t) y * width + x] = (uint16_t) (0x4208 + ((x / 16 + y / 16) & 1) * 0x0841);
+        render_controls(&controls);
+        if (with_menu) {
+            current_rom = "";
+            menu_layout();
+            for (int i = 0; i < ITEM_COUNT; i++) menu.enabled[i] = i != ITEM_LOAD;
+            snprintf(menu.status, sizeof(menu.status), "SAVED");
+            shadow = c.px; /* the stand-in game rows are the backdrop */
+            shadow_rows = lay.top;
+            canvas_t out = { calloc((size_t) width * height, 2), width, height };
+            if (out.px) {
+                menu_compose(&out);
+                free(c.px);
+                c = out;
+            }
+            shadow = NULL;
+            shadow_rows = 0;
+        }
+        FILE * f = fopen(ppm_path, "wb");
+        ok = f != NULL;
+        if (f) {
+            fprintf(f, "P6\n%d %d\n255\n", width, height);
+            for (size_t i = 0; i < (size_t) width * height; i++) {
+                uint16_t p = c.px[i];
+                uint8_t rgb[3] = { (uint8_t) (((p >> 11) & 31) * 255 / 31), (uint8_t) (((p >> 5) & 63) * 255 / 63), (uint8_t) ((p & 31) * 255 / 31) };
+                fwrite(rgb, 1, 3, f);
+            }
+            fclose(f);
+        }
+    }
+    free(c.px);
+    surf_w = saved_w;
+    surf_h = saved_h;
+    cfg = saved_cfg;
+    return ok;
 }
 
 /* ---- interactive session ---- */
@@ -1035,6 +2077,7 @@ static void start_watchdog(void) {
 
 static int run_interactive(const char * rom) {
     set_save_dir(rom);
+    current_rom = rom;
     core_start();
     struct retro_system_av_info av;
     void * rom_data;
@@ -1048,30 +2091,73 @@ static int run_interactive(const char * rom) {
         return 1;
     }
     sram_load(rom);
-    max_game_h = surf_h;
+    max_game_h = surf_h * MAX_GAME_PERCENT / 100;
     build_maps((int) av.geometry.base_width, (int) av.geometry.base_height);
-    max_game_h = game_h;
     layout_controls(game_h);
-    if (!draw_screen()) {
+    if (!draw_screen(false)) {
+        runner_log("out of memory");
+        fb_close();
+        core_stop(rom_data);
+        return 1;
+    }
+    if (!presenter_start()) {
         runner_log("out of memory");
         fb_close();
         core_stop(rom_data);
         return 1;
     }
     input_open();
+    input_pump();
+    if (active_contacts() > 0) gesture.ignore = true; /* the touch that started the game is not a tap */
     bool have_audio = audio_open((unsigned) (av.timing.sample_rate + 0.5));
     start_watchdog();
 
     uint64_t frame_ns = (uint64_t) (1e9 / av.timing.fps), next = now_ns(), late = 0, frames = 0;
+    uint64_t run_total_ns = 0, audio_total_ns = 0, sleep_total_ns = 0, run_max_ns = 0;
     double c_start = cpu_seconds();
     uint64_t t_start = now_ns();
     while (!quit_flag) {
         atomic_fetch_add(&heartbeat, 1);
         input_pump();
         if (quit_flag) break;
+        if (menu_open) {
+            menu_step();
+            continue;
+        }
+        if (resume_pending) {
+            resume_pending = false;
+            next = now_ns();
+        }
+        bool open_menu = power_tap || (gesture_result.done && tap_in_game_center(&gesture_result));
+        power_tap = false;
+        gesture_result.done = false;
+        if (open_menu) {
+            menu_begin();
+            continue;
+        }
+        frameskip_begin();
+        uint64_t run_t0 = now_ns();
         retro_run();
+        uint64_t run_t1 = now_ns();
+        uint64_t run_ns = run_t1 - run_t0;
         bool audio_paced = audio_flush();
+        run_total_ns += run_ns;
+        audio_total_ns += now_ns() - run_t1;
+        if (run_ns > run_max_ns) run_max_ns = run_ns;
+        frameskip_end(run_ns, frame_ns);
         frames++;
+        if (av_pending) {
+            /* The core changed its timing or sample rate while running. */
+            struct retro_system_av_info now_av;
+            av_pending = false;
+            retro_get_system_av_info(&now_av);
+            if (now_av.timing.fps > 0) frame_ns = (uint64_t) (1e9 / now_av.timing.fps);
+            if ((unsigned) (now_av.timing.sample_rate + 0.5) != (unsigned) (av.timing.sample_rate + 0.5)) {
+                audio_close();
+                have_audio = audio_open((unsigned) (now_av.timing.sample_rate + 0.5));
+            }
+            av = now_av;
+        }
         next += frame_ns;
         uint64_t now = now_ns();
         if (have_audio && audio_paced) {
@@ -1079,6 +2165,7 @@ static int run_interactive(const char * rom) {
         } else if (now < next) {
             struct timespec ts = { (time_t) ((next - now) / 1000000000ull), (long) ((next - now) % 1000000000ull) };
             nanosleep(&ts, NULL);
+            sleep_total_ns += next - now;
         } else if (now - next > frame_ns) {
             late++;
             next = now;
@@ -1088,30 +2175,104 @@ static int run_interactive(const char * rom) {
     runner_log("ran %llu frames in %.1fs (%.1f fps), cpu %.0f%%, late resyncs %llu, max touches %d",
                (unsigned long long) frames, wall, wall > 0 ? (double) frames / wall : 0.0,
                wall > 0 ? 100 * (cpu_seconds() - c_start) / wall : 0.0, (unsigned long long) late, max_touches);
+    if (frames) {
+        const double n = (double) frames, ms = 1e6;
+        runner_log("per frame: core %.2f ms (max %.2f; video scaling %.2f of it), audio write %.2f ms (blocked "
+                   "pacing), sleep %.2f ms, budget %.2f ms; core alone %.0f%% of real time",
+                   (double) run_total_ns / ms / n, (double) run_max_ns / ms, (double) scale_ns_total / ms / n,
+                   (double) audio_total_ns / ms / n, (double) sleep_total_ns / ms / n, (double) frame_ns / ms,
+                   run_total_ns ? 100.0 * n * (double) frame_ns / (double) run_total_ns : 0.0);
+    }
+    if (cfg.frameskip != FRAMESKIP_OFF)
+        runner_log("frameskip: %llu of %llu frames had their video skipped", (unsigned long long) video_skipped,
+                   (unsigned long long) frames);
 
     wait_for_release();
     sram_save(rom);
     audio_close();
     input_close();
+    presenter_stop();
+    if (presenter.submitted) {
+        const double shown = presenter.shown ? (double) presenter.shown : 1.0, ms = 1e6;
+        runner_log("present: %llu frames handed over, %llu shown, %llu dropped (a newer one replaced them); "
+                   "show avg %.2f max %.2f ms = copy avg %.2f + pan avg %.2f ms (pan max %.2f ms, the wait for the display)",
+                   (unsigned long long) presenter.submitted, (unsigned long long) presenter.shown,
+                   (unsigned long long) presenter.dropped, (double) presenter.show_ns_total / ms / shown,
+                   (double) presenter.show_ns_max / ms, (double) copy_ns_total / ms / shown,
+                   (double) pan_ns_total / ms / shown, (double) pan_ns_max / ms);
+    }
     fb_close();
+    free(shadow);
+    shadow = NULL;
     core_stop(rom_data);
     return 0;
+}
+
+/* Applies "--opt key=value" and "--frameskip" over the emulator.json settings. */
+static bool apply_cli_overrides(char ** opts, int opt_count, char ** skip_opts, int skip_opt_count,
+                                const char * frameskip, const char * stretch_arg) {
+    if (stretch_arg) {
+        if (strcmp(stretch_arg, "on") != 0 && strcmp(stretch_arg, "off") != 0) {
+            fprintf(stderr, LOG_PREFIX "--audio-stretch needs on or off, got %s\n", stretch_arg);
+            return false;
+        }
+        cfg.audio_stretch = strcmp(stretch_arg, "on") == 0;
+    }
+    if (frameskip && !frontend_config_parse_frameskip(frameskip, &cfg.frameskip)) {
+        fprintf(stderr, LOG_PREFIX "unknown frameskip mode %s\n", frameskip);
+        return false;
+    }
+    for (int i = 0; i < opt_count + skip_opt_count; i++) {
+        bool skip = i >= opt_count;
+        const char * arg = skip ? skip_opts[i - opt_count] : opts[i];
+        char key[FRONTEND_OPTION_TEXT];
+        const char * eq = strchr(arg, '=');
+        size_t key_len = eq ? (size_t) (eq - arg) : 0;
+        if (!eq || !key_len || key_len >= sizeof(key)) {
+            fprintf(stderr, LOG_PREFIX "--opt and --skip-opt need key=value, got %s\n", arg);
+            return false;
+        }
+        memcpy(key, arg, key_len);
+        key[key_len] = '\0';
+        if (!frontend_config_set_option(&cfg, key, eq + 1, skip)) {
+            fprintf(stderr, LOG_PREFIX "too many options\n");
+            return false;
+        }
+    }
+    return true;
 }
 
 int frontend_main(int argc, char ** argv) {
     install_signal_handlers();
     if (argc < 2) {
-        fprintf(stderr, LOG_PREFIX "usage: %s ROM [--bench N]\n", argv[0]);
+        fprintf(stderr, LOG_PREFIX "usage: %s ROM [--bench N] [--opt key=value]... [--frameskip off|auto|half] [--audio-stretch on|off] "
+                "[--skip-opt key=value]... [--budget-ms N]\n", argv[0]);
         return 2;
     }
     const char * rom = argv[1];
+    const char * frameskip = NULL, * stretch_arg = NULL;
+    char * opts[FRONTEND_MAX_OPTIONS], * skip_opts[FRONTEND_MAX_OPTIONS];
+    int opt_count = 0, skip_opt_count = 0;
     long bench = 0;
     for (int i = 2; i < argc; i++) {
-        if (strcmp(argv[i], "--bench") == 0 && i + 1 < argc) bench = strtol(argv[++i], NULL, 10);
-        else {
+        if (strcmp(argv[i], "--bench") == 0 && i + 1 < argc) {
+            bench = strtol(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--budget-ms") == 0 && i + 1 < argc) {
+            bench_budget_ns = (uint64_t) (strtod(argv[++i], NULL) * 1e6);
+        } else if (strcmp(argv[i], "--frameskip") == 0 && i + 1 < argc) {
+            frameskip = argv[++i];
+        } else if (strcmp(argv[i], "--audio-stretch") == 0 && i + 1 < argc) {
+            stretch_arg = argv[++i];
+        } else if (strcmp(argv[i], "--opt") == 0 && i + 1 < argc && opt_count < FRONTEND_MAX_OPTIONS) {
+            opts[opt_count++] = argv[++i];
+        } else if (strcmp(argv[i], "--skip-opt") == 0 && i + 1 < argc && skip_opt_count < FRONTEND_MAX_OPTIONS) {
+            skip_opts[skip_opt_count++] = argv[++i];
+        } else {
             fprintf(stderr, LOG_PREFIX "unknown argument %s\n", argv[i]);
             return 2;
         }
     }
+    load_settings(argv[0]);
+    if (!apply_cli_overrides(opts, opt_count, skip_opts, skip_opt_count, frameskip, stretch_arg)) return 2;
     return bench > 0 ? run_bench(rom, bench) : run_interactive(rom);
 }

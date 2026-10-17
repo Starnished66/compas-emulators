@@ -1,0 +1,17 @@
+{
+  "id": "gearboy",
+  "name": "Gearboy",
+  "version": "1.0.0",
+  "protocol": 1,
+  "exec": "gearboy",
+  "systems": [
+    { "id": "gb", "name": "Game Boy", "games_dir": "GB", "extensions": ["gb", "dmg"] },
+    { "id": "gbc", "name": "Game Boy Color", "games_dir": "GBC", "extensions": ["gbc", "cgb"] }
+  ],
+  "author": "Compás",
+  "license": "GPL-3.0",
+  "description": "Plays Nintendo Game Boy and Game Boy Color games. Based on Gearboy.",
+  "frontend": {
+    "buttons": ["b", "a", "select", "start"]
+  }
+}

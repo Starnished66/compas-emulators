@@ -1,0 +1,17 @@
+{
+  "id": "clownmd",
+  "name": "ClownMDEmu",
+  "version": "0.0.0",
+  "protocol": 1,
+  "exec": "clownmd",
+  "systems": [
+    { "id": "md", "name": "Sega Mega Drive", "games_dir": "MegaDrive", "extensions": ["md", "gen", "bin"] }
+  ],
+  "author": "Compás",
+  "license": "AGPL-3.0",
+  "description": "Experimental, not shipped. Frontend defaults for the speed work: see experimental/clownmd/core.mk.",
+  "frontend": {
+    "buttons": ["y", "b", "a", "start"],
+    "audio_stretch": true
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "id": "gearsystem",
+  "name": "Gearsystem",
+  "version": "1.0.0",
+  "protocol": 1,
+  "exec": "gearsystem",
+  "systems": [
+    { "id": "sms", "name": "Master System", "games_dir": "MasterSystem", "extensions": ["sms"] },
+    { "id": "gg", "name": "Game Gear", "games_dir": "GameGear", "extensions": ["gg"] },
+    { "id": "sg1000", "name": "SG-1000", "games_dir": "SG-1000", "extensions": ["sg"] }
+  ],
+  "author": "Compás",
+  "license": "GPL-3.0",
+  "description": "Plays Sega Master System, Sega Game Gear and Sega SG-1000 games. Based on Gearsystem.",
+  "frontend": {
+    "buttons": ["b", "a", "start"]
+  }
+}

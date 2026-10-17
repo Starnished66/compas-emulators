@@ -40,10 +40,17 @@ player (log one line, show nothing).
 }
 ```
 
-- `name` <= 64 bytes, `version` <= 31, `exec` a plain file name (no `/`), `description` <= 400.
-- `systems`: 1 to 8 entries. `games_dir` is a plain folder name (no `/`, not `.`/`..`), `extensions` are
-  lowercase, without the dot, 1 to 8 per system, each <= 7 bytes.
-- Unknown keys are ignored (forward compatibility).
+- `name` <= 64 bytes, `version` <= 31, `exec` a plain file name (no `/`, <= 63), `description` <= 400.
+- `systems`: 1 to 8 entries. Each has `id` (letters, digits, `_`, `-`, <= 15), `name` (<= 32), `games_dir`
+  (a plain folder name: no `/`, not `.`/`..`, <= 63) and `extensions` (lowercase, without the dot, 1 to 8 per
+  system, each <= 7 bytes, letters and digits).
+- `free_player_memory` (optional, boolean, default false): the player releases its rebuildable caches
+  (screen snapshots, decoded images, thumbnails) before launching this emulator, for emulators that need most of
+  the device memory, such as Doom. Light emulators leave it off so returning to the player stays instant.
+- Unknown keys are ignored (forward compatibility). The emulators in this repository keep their frontend settings
+  under a `frontend` key, see `frontend/config.h` and README.md.
+
+The limits above are what the player enforces; the manifest file itself must be <= 16 KiB.
 
 ## Games
 
@@ -51,6 +58,10 @@ Games for a system live in `<SD>/Games/<games_dir>/` (target SD root `/data/mnt/
 Flat folder; files whose extension matches (case-insensitive) are games; names starting with `.` are
 skipped; the label is the file name without extension, sorted case-insensitively. Save files the emulator
 writes next to the ROM (for example `<rom>.srm`) are not games because their extensions do not match.
+
+An emulator package may also bundle games: files installed under `<root>/<id>/games/<games_dir>/` (same
+`games_dir` names and extension rules) are listed together with the SD card's games of that system. The packager
+(`tools/build_index.py`) accepts nested files only under `games/<games_dir>/` of a system the manifest declares.
 
 ## Launch (protocol 1)
 
@@ -72,7 +83,7 @@ The emulator, while it runs:
 - `EVIOCGRAB`s every `/dev/input/event*` so the player sees no input.
 - Opens ALSA card 0 device 0 and retries for up to 2 s, because the player closes its device asynchronously
   after a pause; runs silent if it still cannot.
-- Quits on its own on-screen EXIT control or a 1 s hold of KEY_POWER; before exiting waits (max 2 s) until no
+- Quits from its pause menu (EXIT) or on a 1 s hold of KEY_POWER; before exiting waits (max 2 s) until no
   key and no touch is down, so release events do not reach the player.
 - Exits by itself (status 3) if its main loop stalls for 5 s.
 - Writes saves next to the ROM.
@@ -109,7 +120,9 @@ array instead of `plugins`, `protocol` instead of `api_min`, and an `executable`
 }
 ```
 
-`dest` is relative to the emulators root and must start with `<id>/`; no `..`, no absolute paths. The player
+The player limits the catalog to 64 KiB, 32 emulators, 16 files per emulator and 64 MiB per file, each emulator
+needs `<id>/emulator.json` among its files and at least one `executable` file, and `size` must equal the sum of
+its file sizes. `dest` is relative to the emulators root and must start with `<id>/`; no `..`, no absolute paths. The player
 verifies size and sha256 of every file before installing, installs atomically per emulator (download into a
 temporary folder, then rename over the old one), sets mode 0755 on `executable` files and 0644 otherwise.
 Entries with `protocol` != 1 are shown as incompatible and cannot be installed.

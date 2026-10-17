@@ -3,13 +3,22 @@
 
   tools/build_index.py --tag v2026.10.16.1 --stage build/stage --out dist
   tools/build_index.py --validate dist
+  tools/build_index.py --check-manifests emulators
 
 --stage holds one folder per emulator, already populated by `make package`:
-the executable, emulator.json and the license files. The manifest in the
+the executable, emulator.json, the license files and, under games/<games_dir>/,\nthe games bundled with the emulator. The manifest in the
 stage folder is the one the player will read, so index fields come from it
 and cannot drift from what is installed. dist/ gets every file under a flat
-asset name <id>--<file>, index.json and SHA256SUMS. --validate re-checks a
+asset name <id>--<file> (a nested file games/Doom/x.wad becomes <id>--games--Doom--x.wad), index.json and SHA256SUMS. --validate re-checks a
 finished dist/ (index rules plus every asset's size and SHA-256).
+--check-manifests checks the emulator.json of every folder under the given
+directory without building anything.
+
+The limits below are the ones the player enforces (compas-player
+src/core/emulator_registry.c, src/network/emulator_store.c), which are
+stricter than docs/PROTOCOL.md in places: system id <= 15 bytes, system name
+<= 32 bytes, manifest <= 16 KiB, index <= 64 KiB, <= 32 emulators, <= 16 files
+and <= 64 MiB per file, at most 96 bytes of joined system names are shown.
 """
 
 import argparse
@@ -31,12 +40,16 @@ ASSET_RE = re.compile(r"[A-Za-z0-9._-]+", re.ASCII)
 FILE_NAME_RE = re.compile(r"[A-Za-z0-9._-]+", re.ASCII)
 EXT_RE = re.compile(r"[a-z0-9]{1,7}", re.ASCII)
 SHA_RE = re.compile(r"[0-9a-f]{64}", re.ASCII)
-# The contract sets no per-file limit; these keep a release well inside any
-# sane player limit and stop a runaway build.
-MAX_FILE_BYTES = 8 * 1024 * 1024
-MAX_INDEX_BYTES = 256 * 1024
-MAX_EMULATORS = 64
+# The player's limits (STORE_FILE_LIMIT, 64 MiB since the player that also lists bundled games, STORE_INDEX_LIMIT, MANIFEST_LIMIT,
+# EMULATOR_STORE_MAX_EMULATORS, EMULATOR_STORE_MAX_FILES).
+MAX_FILE_BYTES = 64 << 20
+MAX_INDEX_BYTES = 64 * 1024
+MAX_MANIFEST_BYTES = 16 * 1024
+MAX_EMULATORS = 32
 MAX_FILES_PER_EMULATOR = 16
+MAX_SYSTEM_NAMES_SHOWN = 96
+SYSTEM_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,15}", re.ASCII)
+BUTTON_NAMES = {"a", "b", "x", "y", "l", "r", "select", "start"}
 
 
 class BuildError(Exception):
@@ -81,6 +94,7 @@ def check_manifest(m, folder):
     if type(m.get("protocol")) is not int or m["protocol"] != PROTOCOL:
         raise BuildError(f"{where}: protocol must be {PROTOCOL}")
     plain_name(m.get("exec"), f"{where}: exec")
+    text(m["exec"], f"{where}: exec", 63)
     text(m.get("description"), f"{where}: description", 400)
     text(m.get("author", ""), f"{where}: author", 64, required=False)
     text(m.get("license", ""), f"{where}: license", 64, required=False)
@@ -90,15 +104,55 @@ def check_manifest(m, folder):
     for s in systems:
         if not isinstance(s, dict):
             raise BuildError(f"{where}: every system must be an object")
-        text(s.get("name"), f"{where}: system name", 64)
+        if not isinstance(s.get("id"), str) or not SYSTEM_ID_RE.fullmatch(s["id"]):
+            raise BuildError(f"{where}: system id must match {SYSTEM_ID_RE.pattern}")
+        text(s.get("name"), f"{where}: system name", 32)
+        text(s.get("games_dir"), f"{where}: games_dir", 63)
         plain_name(s.get("games_dir"), f"{where}: games_dir")
+        if " " in s["games_dir"]:
+            raise BuildError(f"{where}: games_dir {s['games_dir']!r} must not contain spaces")
         exts = s.get("extensions")
         if not isinstance(exts, list) or not 1 <= len(exts) <= 8:
             raise BuildError(f"{where}: extensions must list 1 to 8 entries")
         for e in exts:
             if not isinstance(e, str) or not EXT_RE.fullmatch(e):
                 raise BuildError(f"{where}: extension {e!r} must be lowercase, without the dot, at most 7 bytes")
+    if len({s["id"] for s in systems}) != len(systems):
+        raise BuildError(f"{where}: duplicate system id")
+    if len(", ".join(s["name"] for s in systems).encode("utf-8")) > MAX_SYSTEM_NAMES_SHOWN:
+        raise BuildError(f"{where}: system names joined are over {MAX_SYSTEM_NAMES_SHOWN} bytes (the store truncates them)")
+    check_frontend(m.get("frontend"), where)
     return m
+
+
+def check_frontend(fe, where):
+    """The optional "frontend" object read by the emulator's own frontend (frontend/config.h)."""
+    if fe is None:
+        return
+    if not isinstance(fe, dict):
+        raise BuildError(f"{where}: frontend must be an object")
+    buttons = fe.get("buttons")
+    if buttons is not None and (not isinstance(buttons, list) or not buttons or
+                                any(b not in BUTTON_NAMES for b in buttons)):
+        raise BuildError(f"{where}: frontend.buttons must list names from {sorted(BUTTON_NAMES)}")
+    options = fe.get("options")
+    if options is not None:
+        if not isinstance(options, dict) or len(options) > 32:
+            raise BuildError(f"{where}: frontend.options must be an object of at most 32 entries")
+        for k, v in options.items():
+            if len(k.encode()) > 63 or isinstance(v, (dict, list)) or len(str(v).encode()) > 63:
+                raise BuildError(f"{where}: frontend option {k!r} is too long or not a plain value")
+    if fe.get("frameskip", "off") not in ("off", "auto", "half"):
+        raise BuildError(f"{where}: frontend.frameskip must be off, auto or half")
+    if not isinstance(fe.get("audio_stretch", False), bool):
+        raise BuildError(f"{where}: frontend.audio_stretch must be true or false")
+    skip_options = fe.get("skip_options")
+    if skip_options is not None:
+        if not isinstance(skip_options, dict) or len(skip_options) > 32:
+            raise BuildError(f"{where}: frontend.skip_options must be an object of at most 32 entries")
+        for k, v in skip_options.items():
+            if len(k.encode()) > 63 or isinstance(v, (dict, list)) or len(str(v).encode()) > 63:
+                raise BuildError(f"{where}: frontend skip option {k!r} is too long or not a plain value")
 
 
 def check_entry(e, label):
@@ -120,6 +174,8 @@ def check_entry(e, label):
     if (not isinstance(systems, list) or not 1 <= len(systems) <= 8
             or any(not isinstance(s, str) or not s for s in systems)):
         raise BuildError(f"{label}: systems must list 1 to 8 names")
+    if any(len(s.encode("utf-8")) > 32 for s in systems):
+        raise BuildError(f"{label}: a system name is over 32 bytes")
     files = e.get("files")
     if not isinstance(files, list) or not 1 <= len(files) <= MAX_FILES_PER_EMULATOR:
         raise BuildError(f"{label}: files must list 1 to {MAX_FILES_PER_EMULATOR} entries")
@@ -173,6 +229,33 @@ def check_index(index):
             assets.add(f["asset"])
 
 
+def staged_files(base, folder):
+    """Relative paths ('/' separated) of the files of one staged emulator. Files sit
+    directly in the folder, or under games/<games_dir>/ for games bundled with the
+    emulator (the player lists those); nothing else may be nested."""
+    names = []
+    for dirpath, dirnames, filenames in os.walk(base):
+        dirnames.sort()
+        rel_dir = os.path.relpath(dirpath, base).replace(os.sep, "/")
+        rel_dir = "" if rel_dir == "." else rel_dir
+        depth = len(rel_dir.split("/")) if rel_dir else 0
+        for d in dirnames:
+            if not FILE_NAME_RE.fullmatch(d) or os.path.islink(os.path.join(dirpath, d)):
+                raise BuildError(f"{folder}/{rel_dir}/{d}: bad folder name")
+            if (depth == 0 and d != "games") or depth > 1:
+                raise BuildError(f"{folder}/{rel_dir}/{d}: only games/<games_dir>/ may be nested")
+        for name in sorted(filenames):
+            rel = f"{rel_dir}/{name}" if rel_dir else name
+            if not os.path.isfile(os.path.join(dirpath, name)) or os.path.islink(os.path.join(dirpath, name)):
+                raise BuildError(f"{folder}/{rel}: only plain files can be packaged")
+            if not FILE_NAME_RE.fullmatch(name):
+                raise BuildError(f"{folder}/{rel}: file name has characters GitHub would rename")
+            if rel_dir and not (depth == 2 and rel_dir.startswith("games/")):
+                raise BuildError(f"{folder}/{rel}: bundled games belong in games/<games_dir>/")
+            names.append(rel)
+    return sorted(names)
+
+
 def build(tag, stage, out):
     if not TAG_RE.fullmatch(tag):
         raise BuildError(f"tag {tag!r} must be 1 to 63 characters of letters, digits, '.', '_' or '-'")
@@ -190,20 +273,18 @@ def build(tag, stage, out):
             raise BuildError(f"{folder}: missing emulator.json")
         with open(manifest_path, encoding="utf-8") as f:
             m = check_manifest(json.load(f), folder)
-        names = sorted(os.listdir(base))
+        names = staged_files(base, folder)
         if m["exec"] not in names:
             raise BuildError(f"{folder}: executable {m['exec']!r} is not staged")
         files = []
         for name in names:
-            path = os.path.join(base, name)
-            if not os.path.isfile(path):
-                raise BuildError(f"{folder}/{name}: only plain files can be packaged")
-            if not FILE_NAME_RE.fullmatch(name):
-                raise BuildError(f"{folder}/{name}: file name has characters GitHub would rename")
+            path = os.path.join(base, *name.split("/"))
+            if name.startswith("games/") and name.split("/")[1] not in {x["games_dir"] for x in m["systems"]}:
+                raise BuildError(f"{folder}/{name}: {name.split('/')[1]!r} is not a games_dir of this emulator")
             size = os.path.getsize(path)
             if size == 0:
                 raise BuildError(f"{folder}/{name}: empty file; the player refuses empty assets")
-            asset = f"{folder}--{name}"
+            asset = f"{folder}--{name.replace('/', '--')}"
             item = {"asset": asset, "dest": f"{folder}/{name}", "sha256": sha256_of(path), "size": size}
             if name == m["exec"]:
                 item["executable"] = True
@@ -236,6 +317,30 @@ def build(tag, stage, out):
     print(f"wrote {out}/ with {len(emulators)} emulator(s), tag {tag}")
 
 
+def check_manifests(root):
+    folders = sorted(d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d)))
+    if not folders:
+        raise BuildError(f"{root}: no emulator folders")
+    games = {}
+    for folder in folders:
+        path = os.path.join(root, folder, "emulator.json")
+        if not os.path.isfile(path):
+            raise BuildError(f"{folder}: missing emulator.json")
+        if os.path.getsize(path) > MAX_MANIFEST_BYTES:
+            raise BuildError(f"{path}: over {MAX_MANIFEST_BYTES} bytes")
+        with open(path, encoding="utf-8") as f:
+            m = check_manifest(json.load(f), folder)
+        if m["exec"] != folder:
+            raise BuildError(f"{path}: exec must equal the id (the Makefile stages the executable under the id)")
+        if not any(n.startswith("LICENSE.") for n in os.listdir(os.path.join(root, folder))):
+            raise BuildError(f"{folder}: no LICENSE.* file for the core")
+        for s in m["systems"]:
+            other = games.setdefault(s["games_dir"].lower(), folder)
+            if other != folder:
+                print(f"note: games folder {s['games_dir']} is shared by {other} and {folder}")
+    print(f"{root}: {len(folders)} manifest(s) valid")
+
+
 def validate(dist):
     path = os.path.join(dist, "index.json")
     if os.path.getsize(path) > MAX_INDEX_BYTES:
@@ -264,9 +369,12 @@ def main():
     p.add_argument("--stage", default="build/stage", help="folder with one staged folder per emulator")
     p.add_argument("--out", default="dist", help="output folder")
     p.add_argument("--validate", metavar="DIST", help="only validate a finished dist folder")
+    p.add_argument("--check-manifests", metavar="DIR", help="only check the emulator.json files under DIR")
     args = p.parse_args()
     try:
-        if args.validate:
+        if args.check_manifests:
+            check_manifests(args.check_manifests)
+        elif args.validate:
             validate(args.validate)
         else:
             build(args.tag, args.stage, args.out)

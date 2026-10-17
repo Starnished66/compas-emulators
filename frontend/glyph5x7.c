@@ -47,8 +47,12 @@ const uint8_t * glyph5x7_rows(char c) {
         case 'F': { static const uint8_t g[7] = { 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10 }; return g; }
         /* .####   #....   #....   #.###   #...#   #...#   .###. */
         case 'G': { static const uint8_t g[7] = { 0x0F, 0x10, 0x10, 0x17, 0x11, 0x11, 0x0E }; return g; }
+        /* #...#   #...#   #...#   #####   #...#   #...#   #...# */
+        case 'H': { static const uint8_t g[7] = { 0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 }; return g; }
         /* .###.   ..#..   ..#..   ..#..   ..#..   ..#..   .###. */
         case 'I': { static const uint8_t g[7] = { 0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E }; return g; }
+        /* ..###   ...#.   ...#.   ...#.   ...#.   #..#.   .##.. */
+        case 'J': { static const uint8_t g[7] = { 0x07, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0C }; return g; }
         /* #...#   #..#.   #.#..   ##...   #.#..   #..#.   #...# */
         case 'K': { static const uint8_t g[7] = { 0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11 }; return g; }
         /* #....   #....   #....   #....   #....   #....   ##### */
@@ -61,6 +65,8 @@ const uint8_t * glyph5x7_rows(char c) {
         case 'O': { static const uint8_t g[7] = { 0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E }; return g; }
         /* ####.   #...#   #...#   ####.   #....   #....   #.... */
         case 'P': { static const uint8_t g[7] = { 0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10 }; return g; }
+        /* .###.   #...#   #...#   #...#   #.#.#   #..#.   .##.# */
+        case 'Q': { static const uint8_t g[7] = { 0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D }; return g; }
         /* ####.   #...#   #...#   ####.   #.#..   #..#.   #...# */
         case 'R': { static const uint8_t g[7] = { 0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11 }; return g; }
         /* .####   #....   #....   .###.   ....#   ....#   ####. */
@@ -77,6 +83,8 @@ const uint8_t * glyph5x7_rows(char c) {
         case 'X': { static const uint8_t g[7] = { 0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11 }; return g; }
         /* #...#   #...#   .#.#.   ..#..   ..#..   ..#..   ..#.. */
         case 'Y': { static const uint8_t g[7] = { 0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04 }; return g; }
+        /* #####   ....#   ...#.   ..#..   .#...   #....   ##### */
+        case 'Z': { static const uint8_t g[7] = { 0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F }; return g; }
 
         /* .....   .....   ..#..   .....   ..#..   .....   ..... */
         case ':': { static const uint8_t g[7] = { 0x00, 0x00, 0x04, 0x00, 0x04, 0x00, 0x00 }; return g; }

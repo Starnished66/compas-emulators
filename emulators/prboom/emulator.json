@@ -1,0 +1,27 @@
+{
+  "id": "prboom",
+  "name": "PrBoom",
+  "version": "1.0.0",
+  "protocol": 1,
+  "exec": "prboom",
+  "free_player_memory": true,
+  "systems": [
+    { "id": "doom", "name": "Doom", "games_dir": "Doom", "extensions": ["wad"] }
+  ],
+  "author": "Compás",
+  "license": "GPL-3.0, GPL-2.0 and BSD-3-Clause",
+  "description": "Plays Doom engine games. Comes with Freedoom, a free game; you can also copy your own Doom WADs to the Games/Doom folder on the SD card. Based on PrBoom.",
+  "frontend": {
+    "buttons": ["a", "b", "x", "y", "l", "r", "select", "start"],
+    "options": {
+      "prboom-resolution": "320x200",
+      "prboom-color_format": "16bits",
+      "prboom-render_threads": "OFF",
+      "prboom-find_recursive_on": "disabled",
+      "prboom-mmap_wads": "enabled",
+      "prboom-purge_limit": "16",
+      "prboom-wall_decals": "disabled",
+      "prboom-sound_samplerate": "48000"
+    }
+  }
+}

@@ -21,6 +21,12 @@ jobs:
         run: make
       - name: Host self-test
         run: make selftest
+      - name: Smoke test under qemu
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-user
+          tools/fetch_test_roms.sh
+          make smoke
       - name: Build the release assets
         run: make package TAG="$GITHUB_REF_NAME"
       - name: Validate the store index

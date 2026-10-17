@@ -1,0 +1,16 @@
+{
+  "id": "pce",
+  "name": "Beetle PCE Fast",
+  "version": "1.0.0",
+  "protocol": 1,
+  "exec": "pce",
+  "systems": [
+    { "id": "pce", "name": "PC Engine / TurboGrafx-16", "games_dir": "PCEngine", "extensions": ["pce"] }
+  ],
+  "author": "Compás",
+  "license": "GPL-3.0 and GPL-2.0-or-later",
+  "description": "Plays NEC PC Engine and TurboGrafx-16 HuCard games. CD games are not supported. Based on Beetle PCE Fast (Mednafen).",
+  "frontend": {
+    "buttons": ["b", "a", "select", "start"]
+  }
+}
