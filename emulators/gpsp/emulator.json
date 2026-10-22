@@ -1,9 +1,10 @@
 {
   "id": "gpsp",
   "name": "gpSP",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "protocol": 1,
   "exec": "gpsp",
+  "free_player_memory": true,
   "systems": [
     { "id": "gba", "name": "Game Boy Advance", "games_dir": "GBA", "extensions": ["gba", "agb"] }
   ],
@@ -11,6 +12,7 @@
   "license": "GPL-3.0 and GPL-2.0-or-later",
   "description": "Plays Nintendo Game Boy Advance games. Based on gpSP, with its dynamic recompiler and built-in BIOS.",
   "frontend": {
+    "audio_buffer_ms": 0,
     "buttons": ["b", "a", "l", "r", "select", "start"],
     "options": { "gpsp_bios": "builtin", "gpsp_drc": "enabled", "gpsp_sound_rate": "32768" }
   }

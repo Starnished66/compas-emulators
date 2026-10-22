@@ -32,8 +32,8 @@ NEED_STEREO_SOUND :=
 FRONTEND_SUPPORTS_RGB565 :=
 
 wswan_INC = -I$(wswan_DIR)/libretro-common/include
-# Upstream's own FLAGS: -O2 -DNDEBUG -funroll-loops, the defines below, LSB_FIRST.
-wswan_CFLAGS = -O2 -DNDEBUG -funroll-loops $(wswan_FLAGS) -DSIZEOF_DOUBLE=8 -DMEDNAFEN_VERSION_NUMERIC=931 \
+# Preserve upstream's defines and loop-unrolling policy; -O3 is our build choice.
+wswan_CFLAGS = -O3 -DNDEBUG -funroll-loops $(wswan_FLAGS) -DSIZEOF_DOUBLE=8 -DMEDNAFEN_VERSION_NUMERIC=931 \
                -DMPC_FIXED_POINT -DSTDC_HEADERS -D__STDC_LIMIT_MACROS -D__LIBRETRO__ -D_LOW_ACCURACY_ -DINLINE=inline -w -std=gnu99 \
                -I$(wswan_DIR) -I$(wswan_DIR)/mednafen -I$(wswan_DIR)/mednafen/include -I$(wswan_DIR)/mednafen/hw_sound \
                -I$(wswan_DIR)/mednafen/hw_cpu -I$(wswan_DIR)/mednafen/hw_misc -I$(wswan_DIR)/libretro-common/include

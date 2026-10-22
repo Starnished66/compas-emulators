@@ -34,8 +34,8 @@ NEED_CD :=
 FRONTEND_SUPPORTS_RGB565 :=
 
 pce_INC = -I$(pce_DIR)/libretro-common/include
-# Upstream's FLAGS: -O2 -DNDEBUG -funroll-loops and the defines below.
-pce_CFLAGS = -O2 -DNDEBUG -funroll-loops $(pce_FLAGS) -DMEDNAFEN_VERSION_NUMERIC=931 -DWANT_PCE_FAST_EMU \
+# Upstream defines and loop policy, with -O3 for this emulator's hot code.
+pce_CFLAGS = -O3 -DNDEBUG -funroll-loops $(pce_FLAGS) -DMEDNAFEN_VERSION_NUMERIC=931 -DWANT_PCE_FAST_EMU \
              -DSTDC_HEADERS -D__STDC_LIMIT_MACROS -D__LIBRETRO__ -D_LOW_ACCURACY_ -DINLINE=inline -w -std=gnu99 \
              -I$(pce_DIR) -I$(pce_DIR)/mednafen -I$(pce_DIR)/mednafen/include -I$(pce_DIR)/mednafen/hw_sound \
              -I$(pce_DIR)/mednafen/hw_cpu -I$(pce_DIR)/mednafen/hw_misc -I$(pce_DIR)/libretro-common/include

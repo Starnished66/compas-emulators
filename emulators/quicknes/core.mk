@@ -22,5 +22,5 @@ quicknes_INC = -I$(quicknes_DIR)/libretro/libretro-common/include
 # HAVE_NO_LANGEXTRA drops about 300 KB of translated core-option text the
 # frontend never uses.
 quicknes_SELFTEST = 1
-quicknes_CXXFLAGS = -O2 -DNDEBUG -D__LIBRETRO__ -DHAVE_NO_LANGEXTRA -Wno-multichar -Wno-sign-compare -Wno-deprecated-enum-enum-conversion \
+quicknes_CXXFLAGS = -O3 -DNDEBUG -D__LIBRETRO__ -DHAVE_NO_LANGEXTRA -Wno-multichar -Wno-sign-compare -Wno-deprecated-enum-enum-conversion \
                     -I$(quicknes_DIR) -I$(quicknes_DIR)/nes_emu -I$(quicknes_DIR)/libretro $(quicknes_INC)

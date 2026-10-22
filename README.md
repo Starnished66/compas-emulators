@@ -4,6 +4,9 @@ Emulator packages for [Compás](https://github.com/Starnished66/compas-player), 
 R1, R3 Pro II and R3II 2025. The player lists them in its store, installs them in the `.emulators` folder of the SD card and
 launches games from the SD card. The interface between the two is [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
+Supported displays are HiBy R1 (480×800), R3 Pro II (480×720), and R3 II 2025 (320×480).
+TempoTec V1 is excluded from emulator support because its 240×320 display is too small for these controls.
+
 | Emulator | Systems (games folder under `Games/`) | Core | Core license |
 | --- | --- | --- | --- |
 | QuickNES | NES (`NES`: .nes) | [QuickNES_Core](https://github.com/libretro/QuickNES_Core) | LGPL-2.1-or-later |
@@ -16,6 +19,9 @@ launches games from the SD card. The interface between the two is [docs/PROTOCOL
 
 None needs a BIOS. Compressed archives (.zip, .7z) are not supported. Each package ships the core's license text next
 to the executable.
+
+PrBoom applies a tracked upstream-source patch when fetched: composite texture allocations register their
+cache owner pointers, so purging under the 8 MiB threshold clears stale entries before they are reused.
 
 ## Controls
 
@@ -82,6 +88,16 @@ skip drawing but has options that turn parts of it off. For testing, the executa
 `--skip-opt key=value` and `--frameskip MODE` over the manifest, and `--bench N` reports rendered against total frames
 (`--budget-ms N` gives the `auto` policy another frame time).
 
+`--stats-interval N` enables an interactive stderr report every N seconds (disabled by default). Its frame rate is
+emulated frames per second against the core's current target; presenter frames shown are not counted. Core time
+includes the native-frame copy callback. Scaling time is reported separately: it runs on the presenter thread
+during interactive play and synchronously in headless benchmarks or pause snapshots. Audio time is elapsed time in
+the audio write path, including blocking pacing, and is not CPU time. The report also gives process CPU use, audio
+underruns since the last report, and RSS and swap from `/proc`. A report interval restarts after pause-menu activity
+or an audio-rate reopen. For listening benchmarks, leave periodic statistics disabled and avoid synchronous SD
+telemetry: logging and SD writes during play can themselves cause audio underruns. Collect final session counters
+after exit and distinguish startup interruptions from steady-state results.
+
 `audio_stretch` (`false` by default) is for a core that cannot always keep up with real time. The frontend paces the
 game on blocking audio writes, so a slow core drains the device buffer and the audio crackles. With `audio_stretch`
 the frontend reads the buffer fill after every write and, only while the fill is low, lowers the resampling ratio
@@ -89,10 +105,47 @@ the frontend reads the buffer fill after every write and, only while the fill is
 unchanged while the core keeps up. At the end of a session (stderr) it logs the minimum and average
 ratio, the share of time stretched and the average fill, and every 10 s while stretched the current ratio and fill.
 Underruns are counted from the device itself (a write failing with EPIPE; the device is opened with `PCM_NORESTART`
-so tinyalsa reports it, `frontend/xrun.c`), never estimated from the fill. Video is handed to a presenter thread
-(`frontend/present.c`) so the framebuffer pan, which waits for the display, never stalls the core; the session log
-ends with per-frame core, scaling, audio and pan timings.
+so tinyalsa reports it, `frontend/xrun.c`), never estimated from the fill. Native-resolution video is copied into a bounded latest-frame queue
+(`frontend/present.c`); the presenter scales only the newest waiting frame and then writes/pans the framebuffer.
+The core never waits for scaling or display refresh during steady-state play. Source buffers may be reused
+immediately, and geometry changes safely drain and resize the queue. The session log ends with core, scaling,
+audio and pan timings.
 `--audio-stretch on|off` overrides the manifest. The controller is `frontend/stretch.c`.
+
+`frontend.code_residency` defaults to `true`, which pins the frontend's executable code pages resident after
+`emulator.json` is loaded and command-line overrides are applied. Set it to `false` or pass
+`--code-residency off` to disable pinning; `--code-residency on` enables it for that run.
+
+`audio_buffer_ms` defaults to 46, with `--audio-buffer-ms N` overriding the manifest (integer 0..2000).
+Four power-of-two periods approximate the requested total latency; 46 ms selects 512-frame periods at
+44.1/48 kHz. A refused configuration retries with the established 1024-frame periods. Three real underruns
+in a nonstandard period size switch permanently to 1024 for that session, including later rate changes.
+Set 0 to select 1024 from the start; gpSP ships this safe-buffer setting. Requested latency is not a guarantee
+of the device's negotiated behavior. The frontend checks the actual period geometry after opening PCM. If the
+driver changes it, the frontend reopens with start/stop thresholds set to the negotiated total frame capacity
+and the wake-up threshold set to the negotiated period size, then verifies that geometry stayed stable. Invalid
+or repeatedly changing geometry fails the open instead of running with mismatched thresholds.
+Audio underrun counters remain cumulative across device reopens. No frames or audio are skipped by this policy.
+
+The shared nearest-neighbor scaler (`frontend/video_scale.c`) has exact 2x, 3x and 4x RGB565 paths with
+paired aligned stores and repeated-row copies, a 320-to-480 specialization, and mapped fallbacks for other
+sizes and RGB1555/XRGB8888 input. Aspect ratio, margins and pixel output are unchanged. The queue and
+scaler are shared by all seven shipped emulators. Emulator cores and the hot frontend/scaler objects use
+`-O3`; other frontend helpers remain at `-O2`. No emulation timing shortcut or additional fast-math flag is enabled.
+
+Device builds also attempt to pin read-only main-executable text pages (`frontend/residency.c`) to reduce
+code-page faults during memory pressure. Pinning is best effort and bounded by 4 MiB, one eighth of available
+memory, and the process memlock limit. It excludes writable data, heaps, the read-only tail beyond the last
+code page and libraries; missing permissions never prevent a game from starting. Actual speed and latency
+improvements still require device measurements.
+
+WonderSwan ships upstream's 60 Hz mode enabled, leaves the core's audio sample rate at its upstream default,
+and limits the game area to 55% of screen height to leave room for controls. Its eight visible buttons are
+B, A, X, Y, L, R, Select and Start, in both orientations. Select manually toggles the core's rotation for portrait
+games such as Judgement Silversword; portrait orientation is not forced for all games.
+
+These settings reduce rendering work and avoid known buffer-threshold mismatches; they do not guarantee
+hiccup-free audio for every game or device. Continued listening and representative gameplay tests remain necessary.
 
 ## Layout
 
@@ -121,7 +174,7 @@ PATH=../compas-player/toolchains/mipsel-linux-musl-cross/bin:$PATH make
 | Command | Result |
 | --- | --- |
 | `make` | `build/target/<id>/<id>`, a static stripped MIPS32 executable per emulator |
-| `make selftest` | builds the frontend and QuickNES for the host and runs the self-test (frontend layout, settings parser, save state round trip), and checks every manifest (needs only a host compiler) |
+| `make selftest` | builds the frontend and QuickNES for the host and runs the self-test (frontend layout, settings parser, save state round trip), checks PCM negotiation/threshold handling, and checks every manifest (needs a host compiler and Python 3) |
 | `make smoke` | runs every executable under `qemu-mipsel` on a test ROM (`tools/fetch_test_roms.sh` fetches them); skipped if qemu is missing |
 | `make package TAG=v...` | stages each emulator and writes `dist/` with `index.json`; `TAG` defaults to `dev` |
 
@@ -161,3 +214,8 @@ See [docs/ADDING_AN_EMULATOR.md](docs/ADDING_AN_EMULATOR.md).
 The frontend is derived from Compás player code and is GPL-3.0 ([LICENSE](LICENSE)). The cores keep their own licenses
 (table above) and tinyalsa is BSD-style; each package ships those notices next to its executable. The WonderSwan core
 contains an NEC V30MZ emulator that asks for credit to its author, given in `LICENSE.WonderSwan`.
+
+For compiler ablations, use a fresh build directory and a per-core final flag override,
+for example `make BUILD=build/pce-o2 CORE_OPT_pce="-O2 -fno-unroll-loops" stage-pce`.
+Changing compiler flags requires a fresh build directory. Device timing, audio and
+memory measurements decide the selected policy; host/QEMU speed is not a substitute.

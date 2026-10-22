@@ -1,7 +1,7 @@
 {
   "id": "wswan",
   "name": "Beetle WonderSwan",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "protocol": 1,
   "exec": "wswan",
   "systems": [
@@ -12,6 +12,8 @@
   "license": "GPL-3.0 and GPL-2.0-or-later",
   "description": "Plays Bandai WonderSwan and WonderSwan Color games. Based on Beetle WonderSwan (Mednafen).",
   "frontend": {
-    "buttons": ["b", "a", "select", "start"]
+    "game_height_percent": 55,
+    "buttons": ["b", "a", "x", "y", "l", "r", "select", "start"],
+    "options": { "wswan_60hz_mode": "enabled" }
   }
 }

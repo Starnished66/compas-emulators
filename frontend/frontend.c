@@ -16,6 +16,9 @@
 #include "config.h"
 #include "glyph5x7.h"
 #include "present.h"
+#include "video_scale.h"
+#include "residency.h"
+#include "audio_policy.h"
 #include "stretch.h"
 #include "xrun.h"
 #include "libretro.h"
@@ -25,6 +28,7 @@
 #include <fcntl.h>
 #include <linux/fb.h>
 #include <linux/input.h>
+#include <limits.h>
 #include <math.h>
 #include <poll.h>
 #include <pthread.h>
@@ -56,9 +60,6 @@
 #define RELEASE_WAIT_NS 2000000000ull
 #define WATCHDOG_STALL_SECONDS 5
 #define TOUCH_TRACE_LINES 40
-/* The game area never takes more than this share of the screen height; a
- * taller picture is narrowed instead, so the controls always fit. */
-#define MAX_GAME_PERCENT 68
 #define TAP_MAX_NS 300000000ull
 #define TAP_MAX_MOVE_PX 24
 
@@ -99,7 +100,9 @@ static int surf_w, surf_h, surf_stride; /* stride in pixels */
 static int max_game_h;               /* tallest game area allowed */
 static int game_h;                   /* scaled game height of the current frame */
 static int draw_w, draw_x0;          /* scaled width and left margin (narrowed pictures are centered) */
-static int xmap[MAX_SURFACE_WIDTH], ymap[MAX_SURFACE_HEIGHT];
+static video_scale_t main_scale;
+static uint64_t presenter_scale_ns;
+static pthread_mutex_t video_stats_lock = PTHREAD_MUTEX_INITIALIZER;
 static int map_src_w, map_src_h;
 static unsigned last_src_w, last_src_h;
 static uint64_t video_frames;        /* frames scaled and shown */
@@ -112,109 +115,73 @@ static bool capture_frame;           /* video_cb also stores the frame in shadow
 static void relayout_for_game(void);
 static void fb_claim(void);
 static void fb_release(void);
-static void present_frame(void);
+static bool present_frame(const void * data, unsigned w, unsigned h, size_t pitch);
+static bool presenting;
 
 /* Width-fit scaling: the picture fills the screen width unless that would
  * make it taller than max_game_h, then it is narrowed to keep its shape. */
 static void build_maps(int src_w, int src_h) {
-    map_src_w = src_w;
-    map_src_h = src_h;
-    int h = (int) ((int64_t) src_h * surf_w / src_w);
-    draw_w = surf_w;
-    if (h > max_game_h) {
-        h = max_game_h;
-        draw_w = (int) ((int64_t) src_w * h / src_h);
-        if (draw_w < 1) draw_w = 1;
-        if (draw_w > surf_w) draw_w = surf_w;
-    }
-    game_h = h < 1 ? 1 : h;
-    draw_x0 = (surf_w - draw_w) / 2;
-    for (int x = 0; x < draw_w; x++) xmap[x] = (int) ((int64_t) x * src_w / draw_w);
-    for (int y = 0; y < game_h; y++) ymap[y] = (int) ((int64_t) y * src_h / game_h);
-}
-
-static inline uint16_t pixel_to_565(const void * row, int x) {
-    if (pixfmt == RETRO_PIXEL_FORMAT_RGB565) return ((const uint16_t *) row)[x];
-    if (pixfmt == RETRO_PIXEL_FORMAT_XRGB8888) {
-        uint32_t p = ((const uint32_t *) row)[x];
-        return (uint16_t) (((p >> 8) & 0xF800) | ((p >> 5) & 0x07E0) | ((p >> 3) & 0x001F));
-    }
-    uint16_t p = ((const uint16_t *) row)[x];
-    return (uint16_t) (((p & 0x7FE0) << 1) | (p & 0x1F));
-}
-
-/* Two pixels written at once into the uint16_t row buffer. */
-typedef uint32_t __attribute__((may_alias)) pixel_pair_t;
-
-/* One scaled row from RGB565 source pixels through xmap, two pixels per
- * 32-bit store. line + draw_x0 must be 4-byte aligned and draw_w even. */
-static inline void scale_row_pairs(const uint16_t * r, uint16_t * dst) {
-    pixel_pair_t * out = (pixel_pair_t *) dst;
-    for (int x = 0; x < draw_w; x += 2)
-        *out++ = (uint32_t) r[xmap[x]] | ((uint32_t) r[xmap[x + 1]] << 16);
-}
-
-/* The 1.5x case (320 -> 480): destination pixels 0..5 of every 4 source
- * pixels are s0 s0 s1 s2 s2 s3, so three words per four source pixels. */
-static inline void scale_row_3_2(const uint16_t * r, uint16_t * dst, int src_w) {
-    pixel_pair_t * out = (pixel_pair_t *) dst;
-    for (int x = 0; x < src_w; x += 4) {
-        uint32_t s0 = r[x], s1 = r[x + 1], s2 = r[x + 2], s3 = r[x + 3];
-        out[0] = s0 | (s0 << 16);
-        out[1] = s1 | (s2 << 16);
-        out[2] = s2 | (s3 << 16);
-        out += 3;
-    }
-}
-
-/* Framebuffer memory is uncached: never read it back, and write whole rows
- * with memcpy from a row composed in normal RAM. */
-static void video_cb(const void * data, unsigned w, unsigned h, size_t pitch) {
-    static uint16_t line[MAX_SURFACE_WIDTH] __attribute__((aligned(8)));
-    if (!data || !surf || !w || !h) return;
-    last_src_w = w;
-    last_src_h = h;
-    if (video_skip) {
-        video_skipped++;
+    if (!video_scale_init(&main_scale, src_w, src_h, surf_w, max_game_h)) {
+        runner_log("invalid video geometry %dx%d", src_w, src_h);
+        quit_flag = 1;
         return;
     }
-    uint64_t t0 = now_ns();
+    map_src_w = src_w;
+    map_src_h = src_h;
+    draw_w = main_scale.draw_w;
+    draw_x0 = main_scale.draw_x0;
+    game_h = main_scale.game_h;
+}
+
+static video_scale_format_t scale_format(enum retro_pixel_format format) {
+    if (format == RETRO_PIXEL_FORMAT_RGB565) return VIDEO_SCALE_RGB565;
+    if (format == RETRO_PIXEL_FORMAT_XRGB8888) return VIDEO_SCALE_XRGB8888;
+    return VIDEO_SCALE_RGB1555;
+}
+
+/* Benchmarks and pause snapshots scale synchronously. Interactive frames are
+ * copied at native resolution; only the newest pending frame is upscaled by
+ * the presenter. A slow display cannot make the core scale discarded frames. */
+static void video_cb(const void * data, unsigned w, unsigned h, size_t pitch) {
+    if (!data || !w || !h || (!presenting && !surf && !capture_frame)) return;
+    last_src_w = w;
+    last_src_h = h;
+    if (video_skip) { video_skipped++; return; }
+    if (w > MAX_SURFACE_WIDTH || h > MAX_SURFACE_HEIGHT) {
+        runner_log("unsupported native frame %ux%u", w, h);
+        quit_flag = 1;
+        return;
+    }
     if ((int) w != map_src_w || (int) h != map_src_h) {
         int old_game_h = game_h;
         build_maps((int) w, (int) h);
-        memset(line, 0, sizeof(line)); /* margins of a narrowed picture stay black */
-        /* Only a change of the game area height moves the controls. */
+        if (quit_flag) return;
         if (game_h != old_game_h) relayout_for_game();
     }
-    bool keep = capture_frame && shadow;
-    const uint8_t * src = data;
-    const bool rgb565 = pixfmt == RETRO_PIXEL_FORMAT_RGB565;
-    const bool pairs = rgb565 && draw_w % 2 == 0 && draw_x0 % 2 == 0;
-    const bool three_halves = pairs && draw_x0 == 0 && map_src_w % 4 == 0 && draw_w * 2 == map_src_w * 3;
-    int last_sy = -1;
-    for (int y = 0; y < game_h; y++) {
-        int sy = ymap[y];
-        if (sy != last_sy) {
-            const void * row = src + (size_t) sy * pitch;
-            if (three_halves) {
-                scale_row_3_2(row, line, map_src_w);
-            } else if (pairs) {
-                scale_row_pairs(row, line + draw_x0);
-            } else if (rgb565) {
-                const uint16_t * r = row;
-                for (int x = 0; x < draw_w; x++) line[draw_x0 + x] = r[xmap[x]];
-            } else {
-                for (int x = 0; x < draw_w; x++) line[draw_x0 + x] = pixel_to_565(row, xmap[x]);
-            }
-            last_sy = sy;
+    if (presenting && !capture_frame) {
+        if (!present_frame(data, w, h, pitch)) quit_flag = 1;
+    } else {
+        uint16_t * dst = capture_frame ? shadow : surf;
+        size_t stride = capture_frame ? (size_t) surf_w : (size_t) surf_stride;
+        uint64_t t0 = now_ns();
+        if (!video_scale_render(&main_scale, data, pitch, scale_format(pixfmt), dst, stride)) {
+            runner_log("invalid video frame pitch");
+            quit_flag = 1;
+            return;
         }
-        memcpy(surf + (size_t) y * surf_stride, line, (size_t) surf_w * 2);
-        if (keep) memcpy(shadow + (size_t) y * surf_w, line, (size_t) surf_w * 2);
+        scale_ns_total += now_ns() - t0;
+        if (capture_frame) shadow_rows = game_h;
     }
-    if (keep) shadow_rows = game_h;
-    scale_ns_total += now_ns() - t0;
     video_frames++;
-    present_frame();
+}
+
+/* The MIPS target has no lock-free 64-bit atomics. Only interval reporting
+ * takes this lock from the core thread; normal frames never wait for it. */
+static uint64_t video_scaling_ns(void) {
+    pthread_mutex_lock(&video_stats_lock);
+    uint64_t total = scale_ns_total + presenter_scale_ns;
+    pthread_mutex_unlock(&video_stats_lock);
+    return total;
 }
 
 /* ---- audio ---- */
@@ -238,16 +205,21 @@ static void audio_sample_cb(int16_t l, int16_t r) {
 }
 
 #ifndef HOST_BUILD
-/* The R1 codec only accepts four periods; 512-frame periods underrun
- * constantly (see the comment in audio_output.c). Blocking writes against
- * this buffer are what pace the emulation. */
-#define AUDIO_PERIOD_FRAMES 1024
-#define AUDIO_PERIOD_COUNT 4
+/* The R1 codec accepts four periods. 46 ms is the requested default latency; three real
+ * EPIPE recoveries restore the proven 1024-frame safe period for this run. */
 /* The player's audio thread closes its device asynchronously after a pause. */
 #define AUDIO_OPEN_RETRY_MS 100
 #define AUDIO_OPEN_TIMEOUT_MS 2000
 
+#ifdef FRONTEND_TEST_PCM_AVAIL_MIN_FRAMES
+_Static_assert(FRONTEND_TEST_PCM_AVAIL_MIN_FRAMES > 0,
+               "FRONTEND_TEST_PCM_AVAIL_MIN_FRAMES must be positive");
+#endif
+
 static struct pcm * pcm;
+static unsigned audio_active_period = AUDIO_POLICY_SAFE_PERIOD_FRAMES;
+static unsigned audio_short_underrun_base;
+static bool audio_forced_safe;
 static xrun_stats_t audio_xr;        /* real underruns and recoveries, see xrun.h */
 static stretch_t stretch;
 static uint32_t stretch_ratio_q16 = STRETCH_Q16_ONE;
@@ -324,30 +296,77 @@ static bool resample_init(unsigned rate) {
 }
 
 #ifndef HOST_BUILD
-static bool audio_open(unsigned rate) {
+static bool audio_open_device_period(unsigned period, bool retry_busy) {
     struct pcm_config pcfg = { 0 };
-    stretch_on = cfg.audio_stretch;
-    if (!resample_init(rate)) return false;
     pcfg.channels = 2;
     pcfg.rate = device_rate;
-    pcfg.period_size = AUDIO_PERIOD_FRAMES;
-    pcfg.period_count = AUDIO_PERIOD_COUNT;
+    pcfg.period_size = period;
+    pcfg.period_count = AUDIO_POLICY_PERIOD_COUNT;
     pcfg.format = PCM_FORMAT_S16_LE;
-    pcfg.start_threshold = pcfg.period_size * pcfg.period_count;
-    pcfg.stop_threshold = pcfg.period_size * pcfg.period_count;
-    for (int waited_ms = 0;; waited_ms += AUDIO_OPEN_RETRY_MS) {
-        /* PCM_NORESTART: tinyalsa then reports an xrun (-1 with errno EPIPE) instead of recovering silently. */
+    uint32_t capacity;
+    if (!audio_policy_capacity(pcfg.period_size, pcfg.period_count, &capacity))
+        return false;
+#ifdef FRONTEND_TEST_PCM_AVAIL_MIN_FRAMES
+    pcfg.avail_min = FRONTEND_TEST_PCM_AVAIL_MIN_FRAMES;
+#endif
+    pcfg.start_threshold = capacity;
+    pcfg.stop_threshold = capacity;
+    bool corrected = false;
+    for (int waited_ms = 0;;) {
+        /* PCM_NORESTART makes underruns visible instead of silently recovering. */
         pcm = pcm_open(0, 0, PCM_OUT | PCM_NORESTART, &pcfg);
         if (pcm && pcm_is_ready(pcm)) {
-            stretch_init(&stretch, pcm_get_buffer_size(pcm), device_rate);
+            const struct pcm_config * active = pcm_get_config(pcm);
+            if (!active || !audio_policy_capacity(active->period_size, active->period_count, &capacity)) {
+                runner_log("audio: invalid negotiated PCM geometry");
+                pcm_close(pcm);
+                pcm = NULL;
+                return false;
+            }
+            if (audio_policy_geometry_changed(pcfg.period_size, pcfg.period_count,
+                                               active->period_size, active->period_count)) {
+                if (corrected) {
+                    runner_log("audio: PCM geometry changed again after correction; refusing inconsistent buffer");
+                    pcm_close(pcm);
+                    pcm = NULL;
+                    return false;
+                }
+                runner_log("audio: PCM requested %u x %u, negotiated %u x %u; reopening before playback",
+                           pcfg.period_size, pcfg.period_count, active->period_size, active->period_count);
+                pcfg.period_size = active->period_size;
+                pcfg.period_count = active->period_count;
+                pcfg.start_threshold = capacity;
+                pcfg.stop_threshold = capacity;
+                /* Keep zero avail_min: tinyalsa resolves it to the new period.
+                 * An explicit diagnostic override is intentionally preserved. */
+                pcm_close(pcm);
+                pcm = NULL;
+                corrected = true;
+                continue;
+            }
+            unsigned long expected_avail = pcfg.avail_min ? pcfg.avail_min : active->period_size;
+            if (pcm_get_buffer_size(pcm) != capacity ||
+                active->start_threshold != capacity || active->stop_threshold != capacity ||
+                active->avail_min != expected_avail || active->avail_min > capacity) {
+                runner_log("audio: inconsistent negotiated PCM buffer or thresholds");
+                pcm_close(pcm);
+                pcm = NULL;
+                return false;
+            }
+            runner_log("audio: PCM %u Hz, requested period %u x %u, active %u x %u, buffer %u frames, start %lu stop %lu avail_min %lu",
+                       pcfg.rate, period, AUDIO_POLICY_PERIOD_COUNT,
+                       active->period_size, active->period_count, capacity,
+                       active->start_threshold, active->stop_threshold, active->avail_min);
+            stretch_init(&stretch, capacity, device_rate);
             stretch_ratio_q16 = STRETCH_Q16_ONE;
             stretch_next_log = 10.0;
-            memset(&audio_xr, 0, sizeof(audio_xr));
+            audio_active_period = active->period_size;
+            audio_short_underrun_base = audio_xr.underruns;
             return true;
         }
         const char * why = pcm ? pcm_get_error(pcm) : "open failed";
-        if (waited_ms >= AUDIO_OPEN_TIMEOUT_MS) {
-            runner_log("audio: %s (continuing silent)", why);
+        if (!retry_busy || waited_ms >= AUDIO_OPEN_TIMEOUT_MS) {
+            runner_log(retry_busy ? "audio: %s (continuing silent)" : "audio: %s", why);
             if (pcm) pcm_close(pcm);
             pcm = NULL;
             return false;
@@ -355,7 +374,32 @@ static bool audio_open(unsigned rate) {
         if (pcm) pcm_close(pcm);
         pcm = NULL;
         usleep(AUDIO_OPEN_RETRY_MS * 1000);
+        waited_ms += AUDIO_OPEN_RETRY_MS;
     }
+}
+
+static bool audio_open(unsigned rate) {
+    stretch_on = cfg.audio_stretch;
+    if (!resample_init(rate)) return false;
+    unsigned period = audio_forced_safe ? AUDIO_POLICY_SAFE_PERIOD_FRAMES :
+                      audio_policy_period_frames(device_rate, cfg.audio_buffer_ms);
+    bool short_request = period != AUDIO_POLICY_SAFE_PERIOD_FRAMES;
+    if (audio_open_device_period(period, false)) return true;
+    if (short_request) {
+        runner_log("audio: short period %u failed; retrying safe %u-frame periods", period,
+                   AUDIO_POLICY_SAFE_PERIOD_FRAMES);
+        period = audio_policy_open_fallback(period, false);
+    }
+    return audio_open_device_period(period, true);
+}
+
+static void audio_restore_safe_period(void) {
+    if (audio_forced_safe || audio_active_period == AUDIO_POLICY_SAFE_PERIOD_FRAMES) return;
+    audio_forced_safe = true;
+    runner_log("audio: %u underruns with %u-frame periods; restoring safe %u-frame periods for this session",
+               AUDIO_POLICY_UNDERRUN_LIMIT, audio_active_period, AUDIO_POLICY_SAFE_PERIOD_FRAMES);
+    if (pcm) { pcm_close(pcm); pcm = NULL; }
+    (void) audio_open_device_period(AUDIO_POLICY_SAFE_PERIOD_FRAMES, true);
 }
 
 /* pcm_state is not in tinyalsa's public header but is a plain exported function of pcm.c. */
@@ -390,7 +434,11 @@ static bool pcm_prepare_op(void * ctx) {
 /* Writes frames to the device, counting and recovering from underruns. */
 static bool pcm_write_counted(const int16_t * data, unsigned frames) {
     const xrun_device_t dev = { pcm_write_op, pcm_prepare_op, pcm };
-    return xrun_write_all(&dev, &audio_xr, data, frames);
+    bool ok = xrun_write_all(&dev, &audio_xr, data, frames);
+    if (audio_active_period != AUDIO_POLICY_SAFE_PERIOD_FRAMES &&
+        audio_policy_restore_safe(audio_active_period, audio_xr.underruns - audio_short_underrun_base))
+        audio_restore_safe_period();
+    return ok;
 }
 
 /* False when the write failed, so the caller paces the frame itself. */
@@ -432,9 +480,9 @@ static bool audio_flush(void) {
  * underrun, no repeated last buffer) and paces the pause loop like real audio
  * does. False when there is no working device and the caller must sleep. */
 static bool audio_silence(void) {
-    static const int16_t quiet[AUDIO_PERIOD_FRAMES * 2];
+    static const int16_t quiet[AUDIO_POLICY_MAX_PERIOD_FRAMES * 2];
     if (!pcm) return false;
-    return pcm_write_counted(quiet, AUDIO_PERIOD_FRAMES);
+    return pcm_write_counted(quiet, audio_active_period);
 }
 
 static void audio_close(void) {
@@ -461,6 +509,14 @@ static bool audio_silence(void) { return false; }
 static void audio_close(void) {}
 #endif
 
+static unsigned audio_underrun_count(void) {
+#ifndef HOST_BUILD
+    return audio_xr.underruns;
+#else
+    return 0;
+#endif
+}
+
 /* ---- framebuffer ---- */
 
 static int fb_fd = -1;
@@ -470,7 +526,26 @@ static struct fb_var_screeninfo vinfo, vinfo_orig;
 static int fb_page;                  /* page the presenter writes next (the one not on screen) */
 static int fb_pages;
 static present_t presenter;
-static bool presenting;              /* the presenter thread runs: all framebuffer writes go through it */
+/* Native-resolution queue; the presenter owns its scale plan and scratch. */
+typedef struct {
+    unsigned w, h;
+    enum retro_pixel_format format;
+} native_frame_t;
+static size_t native_capacity;
+static struct {
+    uint64_t submitted, shown, dropped, show_ns_total, show_ns_max;
+} retired_presenters;
+
+static void retire_presenter_stats(void) {
+    retired_presenters.submitted += presenter.submitted;
+    retired_presenters.shown += presenter.shown;
+    retired_presenters.dropped += presenter.dropped;
+    retired_presenters.show_ns_total += presenter.show_ns_total;
+    if (presenter.show_ns_max > retired_presenters.show_ns_max)
+        retired_presenters.show_ns_max = presenter.show_ns_max;
+}
+static uint16_t * display_pixels;
+static video_scale_t display_scale;
 static uint64_t pan_ns_total, pan_ns_max, copy_ns_total; /* written by the presenter thread, read after it stopped */
 
 static uint16_t * fb_page_ptr(int page) {
@@ -524,20 +599,67 @@ static void fb_show(void * ctx, const uint16_t * px, int rows) {
     fb_page ^= 1;
 }
 
-/* Starts the presenter once the game area height limit is known. */
-static bool presenter_start(void) {
-    size_t bytes = (size_t) surf_stride * (size_t) max_game_h * 2;
-    if (fb_fd < 0 || !present_start(&presenter, bytes, fb_show, NULL)) return false;
+/* The callback owns the scale plan and scratch; geometry/layout on the core
+ * thread is independent. present_claim() serializes all framebuffer access. */
+static void show_native_frame(void * ctx, const uint16_t * pixels, int rows) {
+    (void) ctx;
+    (void) rows;
+    native_frame_t frame;
+    memcpy(&frame, pixels, sizeof(frame));
+    const uint8_t * src = (const uint8_t *) pixels + sizeof(frame);
+    size_t pitch = (size_t) frame.w * (frame.format == RETRO_PIXEL_FORMAT_XRGB8888 ? 4u : 2u);
+    if (display_scale.src_w != (int) frame.w || display_scale.src_h != (int) frame.h) {
+        if (!video_scale_init(&display_scale, (int) frame.w, (int) frame.h, surf_w, max_game_h)) return;
+    }
+    uint64_t t0 = now_ns();
+    if (!video_scale_render(&display_scale, src, pitch, scale_format(frame.format), display_pixels,
+                            (size_t) surf_stride)) return;
+    uint64_t scale_ns = now_ns() - t0;
+    pthread_mutex_lock(&video_stats_lock);
+    presenter_scale_ns += scale_ns;
+    pthread_mutex_unlock(&video_stats_lock);
+    fb_show(NULL, display_pixels, display_scale.game_h);
+}
+
+static bool presenter_start(unsigned w, unsigned h) {
+    if (!w || !h || w > MAX_SURFACE_WIDTH || h > MAX_SURFACE_HEIGHT) return false;
+    /* Allocate the current native format; rare geometry/format growth is
+     * handled by draining and resizing the queue in present_frame(). */
+    size_t bpp = pixfmt == RETRO_PIXEL_FORMAT_XRGB8888 ? 4u : 2u;
+    size_t bytes = sizeof(native_frame_t) + (size_t) w * h * bpp;
+    display_pixels = calloc((size_t) surf_stride * max_game_h, 2);
+    if (!display_pixels || !present_start(&presenter, bytes, show_native_frame, NULL)) {
+        free(display_pixels);
+        display_pixels = NULL;
+        return false;
+    }
+    native_capacity = bytes;
     presenting = true;
-    surf = present_buffer(&presenter);
     return true;
 }
 
-/* video_cb finished a frame in surf: hand it to the presenter without waiting. */
-static void present_frame(void) {
-    if (!presenting) return;
-    present_submit(&presenter, game_h);
-    surf = present_buffer(&presenter);
+static bool present_frame(const void * data, unsigned w, unsigned h, size_t pitch) {
+    size_t row_bytes = (size_t) w * (pixfmt == RETRO_PIXEL_FORMAT_XRGB8888 ? 4u : 2u);
+    if (pitch < row_bytes || pitch > SIZE_MAX / h) return false;
+    size_t bytes = sizeof(native_frame_t) + row_bytes * h;
+    if (bytes > native_capacity) {
+        /* Resizing is rare (e.g. a core enabling an SGB border). Finish the old
+         * frame before replacing its queue; allocation never happens per frame. */
+        present_stop(&presenter);
+        retire_presenter_stats();
+        presenting = false;
+        if (!present_start(&presenter, bytes, show_native_frame, NULL)) return false;
+        native_capacity = bytes;
+        presenting = true;
+    }
+    uint8_t * dst = (uint8_t *) present_buffer(&presenter);
+    native_frame_t frame = { w, h, pixfmt };
+    memcpy(dst, &frame, sizeof(frame));
+    dst += sizeof(frame);
+    const uint8_t * src = data;
+    for (unsigned y = 0; y < h; y++) memcpy(dst + (size_t) y * row_bytes, src + (size_t) y * pitch, row_bytes);
+    present_submit(&presenter, (int) h);
+    return true;
 }
 
 /* Exclusive framebuffer access for the controls and the pause menu. */
@@ -550,11 +672,99 @@ static void fb_release(void) {
 }
 
 static void presenter_stop(void) {
-    if (!presenting) return;
-    present_stop(&presenter); /* the last frame submitted is shown first */
-    presenting = false;
-    surf = NULL;
+    if (presenting) {
+        present_stop(&presenter); /* finish the newest pending frame */
+        retire_presenter_stats();
+        presenting = false;
+    }
+    free(display_pixels);
+    display_pixels = NULL;
 }
+
+#ifdef HOST_BUILD
+/* Exercise the real native-frame callback and presenter without /dev/fb0.
+ * Mutating the source after submission verifies libretro frame lifetime;
+ * changing sizes/formats exercises queue growth and latest-frame draining. */
+bool frontend_video_pipeline_check(void) {
+    static const struct { unsigned w, h; enum retro_pixel_format format; } cases[] = {
+        {160, 144, RETRO_PIXEL_FORMAT_RGB565}, {320, 240, RETRO_PIXEL_FORMAT_RGB565},
+        {320, 240, RETRO_PIXEL_FORMAT_XRGB8888}, {256, 224, RETRO_PIXEL_FORMAT_0RGB1555},
+        {161, 145, RETRO_PIXEL_FORMAT_RGB565}, {240, 160, RETRO_PIXEL_FORMAT_RGB565}
+    };
+    if (presenting || fb_fd >= 0 || fb_mem || shadow || capture_frame) return false;
+    int saved_w = surf_w, saved_h = surf_h, saved_stride = surf_stride, saved_max = max_game_h;
+    int saved_game = game_h, saved_draw = draw_w, saved_x0 = draw_x0;
+    int saved_src_w = map_src_w, saved_src_h = map_src_h;
+    unsigned saved_last_w = last_src_w, saved_last_h = last_src_h;
+    uint64_t saved_frames = video_frames, saved_scale = scale_ns_total;
+    enum retro_pixel_format saved_format = pixfmt;
+    video_scale_t saved_plan = main_scale;
+    bool ok = true;
+    surf_w = 480; surf_h = 800; surf_stride = 486; max_game_h = 544;
+    fb_pages = 1; fb_page = 0;
+    fb_mem = calloc((size_t) surf_stride * surf_h, 2);
+    uint16_t * expected = calloc((size_t) surf_stride * max_game_h, 2);
+    if (!fb_mem || !expected || !presenter_start(160, 144)) ok = false;
+    size_t final_rows = 0;
+    for (size_t i = 0; ok && i < sizeof(cases) / sizeof(cases[0]); i++) {
+        unsigned w = cases[i].w, h = cases[i].h;
+        pixfmt = cases[i].format;
+        size_t bpp = pixfmt == RETRO_PIXEL_FORMAT_XRGB8888 ? 4u : 2u;
+        size_t pitch = w * bpp + 3;
+        uint8_t * allocation = malloc(pitch * h + 1);
+        if (!allocation) { ok = false; break; }
+        uint8_t * source = allocation + 1;
+        for (size_t j = 0; j < pitch * h; j++) source[j] = (uint8_t) (j * 37 + i * 11);
+        video_scale_t plan;
+        ok = video_scale_init(&plan, (int) w, (int) h, surf_w, max_game_h) &&
+             video_scale_render(&plan, source, pitch, scale_format(pixfmt), expected, (size_t) surf_stride);
+        final_rows = (size_t) plan.game_h;
+        video_cb(source, w, h, pitch);
+        memset(source, 0xa5, pitch * h); /* the core may immediately reuse its buffer */
+        free(allocation);
+        if (quit_flag) ok = false;
+    }
+    presenter_stop();
+    if (ok) {
+        for (size_t y = 0; y < final_rows; y++) {
+            if (memcmp(fb_mem + y * surf_stride * 2, expected + y * surf_stride,
+                       (size_t) surf_w * 2) != 0) ok = false;
+            for (int x = surf_w; x < surf_stride; x++)
+                if (((uint16_t *) fb_mem)[y * surf_stride + (size_t) x] != 0) ok = false;
+        }
+    }
+    if (ok) {
+        uint16_t source[160 * 144];
+        for (size_t i = 0; i < 160u * 144u; i++) source[i] = (uint16_t) (i * 13u);
+        shadow = calloc((size_t) surf_w * surf_h, 2);
+        if (!shadow) ok = false;
+        else {
+            video_scale_t plan;
+            pixfmt = RETRO_PIXEL_FORMAT_RGB565;
+            capture_frame = true;
+            shadow_rows = 0;
+            video_cb(source, 160, 144, 160 * 2);
+            capture_frame = false;
+            ok = video_scale_init(&plan, 160, 144, surf_w, max_game_h) &&
+                 video_scale_render(&plan, source, 160 * 2, VIDEO_SCALE_RGB565,
+                                    expected, (size_t) surf_w) &&
+                 shadow_rows == plan.game_h &&
+                 memcmp(shadow, expected, (size_t) surf_w * plan.game_h * 2) == 0;
+            free(shadow); shadow = NULL; shadow_rows = 0;
+        }
+    }
+    free(expected); free(fb_mem); fb_mem = NULL; fb_pages = 0;
+    surf_w = saved_w; surf_h = saved_h; surf_stride = saved_stride; max_game_h = saved_max;
+    game_h = saved_game; draw_w = saved_draw; draw_x0 = saved_x0;
+    map_src_w = saved_src_w; map_src_h = saved_src_h;
+    last_src_w = saved_last_w; last_src_h = saved_last_h;
+    main_scale = saved_plan; pixfmt = saved_format;
+    video_frames = saved_frames; scale_ns_total = saved_scale;
+    presenter_scale_ns = 0;
+    memset(&retired_presenters, 0, sizeof(retired_presenters));
+    return ok;
+}
+#endif
 
 /* Puts the page the player was showing back on screen. Also called by the
  * watchdog thread: one ioctl on state that is not modified after open. */
@@ -1641,7 +1851,7 @@ bool frontend_bench(const char * rom, long frames, frontend_bench_t * out) {
     surf_w = 480;
     surf_h = 800;
     surf_stride = 480;
-    max_game_h = surf_h * MAX_GAME_PERCENT / 100;
+    max_game_h = surf_h * (int) cfg.game_height_percent / 100;
     surf = calloc((size_t) surf_stride * surf_h, 2);
     uint64_t budget_ns = bench_budget_ns ? bench_budget_ns : (uint64_t) (1e9 / av.timing.fps);
     uint64_t audio_ns = 0, t_start = now_ns();
@@ -2075,7 +2285,40 @@ static void start_watchdog(void) {
     if (pthread_create(&thread, NULL, watchdog_main, NULL) == 0) pthread_detach(thread);
 }
 
-static int run_interactive(const char * rom) {
+static void interactive_stats(uint64_t interval_ns, uint64_t * last_time, uint64_t * last_frames,
+                              uint64_t * last_core_ns, uint64_t * last_scale_ns,
+                              uint64_t * last_audio_ns, double * last_cpu_s, unsigned * last_underruns,
+                              uint64_t frames, uint64_t core_ns, uint64_t audio_ns,
+                              double target_fps) {
+    uint64_t now = now_ns();
+    if (!interval_ns || now - *last_time < interval_ns) return;
+    double elapsed = (double) (now - *last_time) / 1e9;
+    uint64_t interval_frames = frames - *last_frames;
+    uint64_t core_delta = core_ns - *last_core_ns;
+    uint64_t scaling_now = video_scaling_ns();
+    uint64_t scale_delta = scaling_now - *last_scale_ns;
+    uint64_t audio_delta = audio_ns - *last_audio_ns;
+    double cpu_now = cpu_seconds();
+    double cpu_percent = elapsed > 0 ? 100.0 * (cpu_now - *last_cpu_s) / elapsed : 0.0;
+    double n = interval_frames ? (double) interval_frames : 1.0;
+    long rss_kb = status_kb("VmRSS");
+    long swap_kb = status_kb("VmSwap");
+    runner_log("stats: %llu frames/%.1fs = %.1f emulated fps (target %.1f), cpu %.0f%%, core %.2f ms/frame, "
+               "scale %.2f ms/frame, audio write/pacing %.2f ms/frame, underruns +%u, RSS %ld KiB, Swap %ld KiB",
+               (unsigned long long) interval_frames, elapsed,
+               elapsed > 0 ? (double) interval_frames / elapsed : 0.0, target_fps, cpu_percent,
+               (double) core_delta / 1e6 / n, (double) scale_delta / 1e6 / n,
+               (double) audio_delta / 1e6 / n, audio_underrun_count() - *last_underruns, rss_kb, swap_kb);
+    *last_time = now;
+    *last_frames = frames;
+    *last_core_ns = core_ns;
+    *last_scale_ns = scaling_now;
+    *last_audio_ns = audio_ns;
+    *last_cpu_s = cpu_now;
+    *last_underruns = audio_underrun_count();
+}
+
+static int run_interactive(const char * rom, unsigned stats_interval) {
     set_save_dir(rom);
     current_rom = rom;
     core_start();
@@ -2091,7 +2334,7 @@ static int run_interactive(const char * rom) {
         return 1;
     }
     sram_load(rom);
-    max_game_h = surf_h * MAX_GAME_PERCENT / 100;
+    max_game_h = surf_h * (int) cfg.game_height_percent / 100;
     build_maps((int) av.geometry.base_width, (int) av.geometry.base_height);
     layout_controls(game_h);
     if (!draw_screen(false)) {
@@ -2100,7 +2343,7 @@ static int run_interactive(const char * rom) {
         core_stop(rom_data);
         return 1;
     }
-    if (!presenter_start()) {
+    if (!presenter_start(av.geometry.base_width, av.geometry.base_height)) {
         runner_log("out of memory");
         fb_close();
         core_stop(rom_data);
@@ -2116,12 +2359,25 @@ static int run_interactive(const char * rom) {
     uint64_t run_total_ns = 0, audio_total_ns = 0, sleep_total_ns = 0, run_max_ns = 0;
     double c_start = cpu_seconds();
     uint64_t t_start = now_ns();
+    uint64_t stats_time = t_start, stats_frames = 0, stats_core_ns = 0, stats_scale_ns = video_scaling_ns();
+    uint64_t stats_audio_ns = 0;
+    double stats_cpu_s = c_start;
+    unsigned stats_underruns = audio_underrun_count();
     while (!quit_flag) {
         atomic_fetch_add(&heartbeat, 1);
         input_pump();
         if (quit_flag) break;
         if (menu_open) {
             menu_step();
+            if (stats_interval) {
+                stats_time = now_ns();
+                stats_frames = frames;
+                stats_core_ns = run_total_ns;
+                stats_scale_ns = video_scaling_ns();
+                stats_audio_ns = audio_total_ns;
+                stats_cpu_s = cpu_seconds();
+                stats_underruns = audio_underrun_count();
+            }
             continue;
         }
         if (resume_pending) {
@@ -2155,6 +2411,15 @@ static int run_interactive(const char * rom) {
             if ((unsigned) (now_av.timing.sample_rate + 0.5) != (unsigned) (av.timing.sample_rate + 0.5)) {
                 audio_close();
                 have_audio = audio_open((unsigned) (now_av.timing.sample_rate + 0.5));
+                if (stats_interval) {
+                    stats_time = now_ns();
+                    stats_frames = frames;
+                    stats_core_ns = run_total_ns;
+                    stats_scale_ns = video_scaling_ns();
+                    stats_audio_ns = audio_total_ns;
+                    stats_cpu_s = cpu_seconds();
+                    stats_underruns = audio_underrun_count();
+                }
             }
             av = now_av;
         }
@@ -2170,6 +2435,11 @@ static int run_interactive(const char * rom) {
             late++;
             next = now;
         }
+        if (stats_interval)
+            interactive_stats((uint64_t) stats_interval * 1000000000ull, &stats_time, &stats_frames,
+                              &stats_core_ns, &stats_scale_ns, &stats_audio_ns, &stats_cpu_s,
+                              &stats_underruns, frames, run_total_ns, audio_total_ns,
+                              av.timing.fps);
     }
     double wall = (double) (now_ns() - t_start) / 1e9;
     runner_log("ran %llu frames in %.1fs (%.1f fps), cpu %.0f%%, late resyncs %llu, max touches %d",
@@ -2177,9 +2447,9 @@ static int run_interactive(const char * rom) {
                wall > 0 ? 100 * (cpu_seconds() - c_start) / wall : 0.0, (unsigned long long) late, max_touches);
     if (frames) {
         const double n = (double) frames, ms = 1e6;
-        runner_log("per frame: core %.2f ms (max %.2f; video scaling %.2f of it), audio write %.2f ms (blocked "
+        runner_log("per frame: core %.2f ms (max %.2f; video scaling %.2f ms on presenter), audio write %.2f ms (blocked "
                    "pacing), sleep %.2f ms, budget %.2f ms; core alone %.0f%% of real time",
-                   (double) run_total_ns / ms / n, (double) run_max_ns / ms, (double) scale_ns_total / ms / n,
+                   (double) run_total_ns / ms / n, (double) run_max_ns / ms, (double) video_scaling_ns() / ms / n,
                    (double) audio_total_ns / ms / n, (double) sleep_total_ns / ms / n, (double) frame_ns / ms,
                    run_total_ns ? 100.0 * n * (double) frame_ns / (double) run_total_ns : 0.0);
     }
@@ -2192,13 +2462,13 @@ static int run_interactive(const char * rom) {
     audio_close();
     input_close();
     presenter_stop();
-    if (presenter.submitted) {
-        const double shown = presenter.shown ? (double) presenter.shown : 1.0, ms = 1e6;
+    if (retired_presenters.submitted) {
+        const double shown = retired_presenters.shown ? (double) retired_presenters.shown : 1.0, ms = 1e6;
         runner_log("present: %llu frames handed over, %llu shown, %llu dropped (a newer one replaced them); "
                    "show avg %.2f max %.2f ms = copy avg %.2f + pan avg %.2f ms (pan max %.2f ms, the wait for the display)",
-                   (unsigned long long) presenter.submitted, (unsigned long long) presenter.shown,
-                   (unsigned long long) presenter.dropped, (double) presenter.show_ns_total / ms / shown,
-                   (double) presenter.show_ns_max / ms, (double) copy_ns_total / ms / shown,
+                   (unsigned long long) retired_presenters.submitted, (unsigned long long) retired_presenters.shown,
+                   (unsigned long long) retired_presenters.dropped, (double) retired_presenters.show_ns_total / ms / shown,
+                   (double) retired_presenters.show_ns_max / ms, (double) copy_ns_total / ms / shown,
                    (double) pan_ns_total / ms / shown, (double) pan_ns_max / ms);
     }
     fb_close();
@@ -2208,15 +2478,24 @@ static int run_interactive(const char * rom) {
     return 0;
 }
 
-/* Applies "--opt key=value" and "--frameskip" over the emulator.json settings. */
+/* Applies command line overrides over the emulator.json settings. */
 static bool apply_cli_overrides(char ** opts, int opt_count, char ** skip_opts, int skip_opt_count,
-                                const char * frameskip, const char * stretch_arg) {
+                                const char * frameskip, const char * stretch_arg,
+                                const char * audio_buffer_arg, const char * residency_arg) {
     if (stretch_arg) {
         if (strcmp(stretch_arg, "on") != 0 && strcmp(stretch_arg, "off") != 0) {
             fprintf(stderr, LOG_PREFIX "--audio-stretch needs on or off, got %s\n", stretch_arg);
             return false;
         }
         cfg.audio_stretch = strcmp(stretch_arg, "on") == 0;
+    }
+    if (audio_buffer_arg && !frontend_config_parse_audio_buffer_ms(audio_buffer_arg, &cfg.audio_buffer_ms)) {
+        fprintf(stderr, LOG_PREFIX "--audio-buffer-ms needs an integer from 0 to 2000, got %s\n", audio_buffer_arg);
+        return false;
+    }
+    if (residency_arg && !frontend_config_parse_code_residency(residency_arg, &cfg.code_residency)) {
+        fprintf(stderr, LOG_PREFIX "--code-residency needs on or off, got %s\n", residency_arg);
+        return false;
     }
     if (frameskip && !frontend_config_parse_frameskip(frameskip, &cfg.frameskip)) {
         fprintf(stderr, LOG_PREFIX "unknown frameskip mode %s\n", frameskip);
@@ -2245,15 +2524,16 @@ static bool apply_cli_overrides(char ** opts, int opt_count, char ** skip_opts, 
 int frontend_main(int argc, char ** argv) {
     install_signal_handlers();
     if (argc < 2) {
-        fprintf(stderr, LOG_PREFIX "usage: %s ROM [--bench N] [--opt key=value]... [--frameskip off|auto|half] [--audio-stretch on|off] "
-                "[--skip-opt key=value]... [--budget-ms N]\n", argv[0]);
+        fprintf(stderr, LOG_PREFIX "usage: %s ROM [--bench N] [--opt key=value]... [--frameskip off|auto|half] [--audio-stretch on|off] [--audio-buffer-ms N] [--code-residency on|off] "
+                "[--stats-interval N] [--skip-opt key=value]... [--budget-ms N]\n", argv[0]);
         return 2;
     }
     const char * rom = argv[1];
-    const char * frameskip = NULL, * stretch_arg = NULL;
+    const char * frameskip = NULL, * stretch_arg = NULL, * audio_buffer_arg = NULL, * residency_arg = NULL;
     char * opts[FRONTEND_MAX_OPTIONS], * skip_opts[FRONTEND_MAX_OPTIONS];
     int opt_count = 0, skip_opt_count = 0;
     long bench = 0;
+    unsigned stats_interval = 0;
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--bench") == 0 && i + 1 < argc) {
             bench = strtol(argv[++i], NULL, 10);
@@ -2263,6 +2543,19 @@ int frontend_main(int argc, char ** argv) {
             frameskip = argv[++i];
         } else if (strcmp(argv[i], "--audio-stretch") == 0 && i + 1 < argc) {
             stretch_arg = argv[++i];
+        } else if (strcmp(argv[i], "--audio-buffer-ms") == 0 && i + 1 < argc) {
+            audio_buffer_arg = argv[++i];
+        } else if (strcmp(argv[i], "--code-residency") == 0 && i + 1 < argc) {
+            residency_arg = argv[++i];
+        } else if (strcmp(argv[i], "--stats-interval") == 0 && i + 1 < argc) {
+            char * end = NULL;
+            errno = 0;
+            long seconds = strtol(argv[++i], &end, 10);
+            if (errno || !end || *end || seconds <= 0 || (unsigned long) seconds > UINT_MAX) {
+                fprintf(stderr, LOG_PREFIX "--stats-interval needs a positive number of seconds\n");
+                return 2;
+            }
+            stats_interval = (unsigned) seconds;
         } else if (strcmp(argv[i], "--opt") == 0 && i + 1 < argc && opt_count < FRONTEND_MAX_OPTIONS) {
             opts[opt_count++] = argv[++i];
         } else if (strcmp(argv[i], "--skip-opt") == 0 && i + 1 < argc && skip_opt_count < FRONTEND_MAX_OPTIONS) {
@@ -2273,6 +2566,13 @@ int frontend_main(int argc, char ** argv) {
         }
     }
     load_settings(argv[0]);
-    if (!apply_cli_overrides(opts, opt_count, skip_opts, skip_opt_count, frameskip, stretch_arg)) return 2;
-    return bench > 0 ? run_bench(rom, bench) : run_interactive(rom);
+    if (!apply_cli_overrides(opts, opt_count, skip_opts, skip_opt_count, frameskip, stretch_arg,
+                             audio_buffer_arg, residency_arg)) return 2;
+#ifndef HOST_BUILD
+    if (cfg.code_residency) {
+        extern char etext[];
+        (void) residency_pin_code((const void *) frontend_main, etext);
+    }
+#endif
+    return bench > 0 ? run_bench(rom, bench) : run_interactive(rom, stats_interval);
 }

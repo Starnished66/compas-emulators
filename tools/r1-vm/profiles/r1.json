@@ -1,0 +1,52 @@
+{
+  "id": "hiby-r1-approx",
+  "label": "HiBy R1 approximate headless benchmark profile",
+  "source": "compas-player/build/emulator-performance benchmark logs captured on HiBy R1 on 2026-10-20",
+  "frames": 1800,
+  "reference_cases": [
+    {
+      "core": "gpsp",
+      "fixture": "GBA/240pee_mb.gba",
+      "reference_wall_seconds": 4.04
+    },
+    {
+      "core": "gearsystem",
+      "fixture": "MasterSystem/test.sms",
+      "reference_wall_seconds": 17.93
+    },
+    {
+      "core": "gearboy",
+      "fixture": "GB/gb240p.gb",
+      "reference_wall_seconds": 15.76
+    },
+    {
+      "core": "wswan",
+      "fixture": "WonderSwan/test.ws",
+      "reference_wall_seconds": 6.47
+    },
+    {
+      "core": "pce",
+      "fixture": "PCEngine/test.pce",
+      "reference_wall_seconds": 7.38
+    }
+  ],
+  "quality": "provisional throughput calibration; not an emulated CPU frequency or MHz model",
+  "limitations": [
+    "The benchmark log set does not record ROM hashes or prove that these fixtures are byte-identical to the original R1 fixtures.",
+    "A single global CPU quota cannot reproduce different per-core performance ratios or the R1's thermal and power behavior.",
+    "The references are headless diagnostic runs and do not represent every game or interactive audio/video pacing."
+  ],
+  "target": {
+    "nominal_ram_kib": 65536,
+    "memtotal_kib": 58196,
+    "swap_total_kib": 24572,
+    "zram_disksize_bytes": 25165824,
+    "kernel": "4.4.94",
+    "isa": "MIPS32r2 little-endian",
+    "vcpus": 1,
+    "hz": 100,
+    "preempt": true,
+    "allocator": "SLAB",
+    "compression": "LZ4 matches firmware config; actual device algorithm still needs confirmation"
+  }
+}

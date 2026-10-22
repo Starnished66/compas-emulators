@@ -4,3 +4,6 @@ third_party/
 tests/roms/
 *.core
 experimental/*/profile/
+
+# Python VM tooling caches
+__pycache__/

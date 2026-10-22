@@ -6,6 +6,7 @@
 #include "libretro.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 typedef struct {
@@ -200,6 +201,42 @@ static bool parse_frontend_object(reader_t * r, frontend_config_t * cfg) {
             if (strcmp(flag, "true") == 0) cfg->audio_stretch = true;
             else if (strcmp(flag, "false") == 0) cfg->audio_stretch = false;
             else return fail(r, "audio_stretch must be true or false");
+        } else if (strcmp(key, "code_residency") == 0) {
+            skip_ws(r);
+            if (r->p < r->end && *r->p == 't' && (size_t) (r->end - r->p) >= 4 &&
+                memcmp(r->p, "true", 4) == 0) {
+                r->p += 4;
+                cfg->code_residency = true;
+            } else if (r->p < r->end && *r->p == 'f' && (size_t) (r->end - r->p) >= 5 &&
+                       memcmp(r->p, "false", 5) == 0) {
+                r->p += 5;
+                cfg->code_residency = false;
+            } else return fail(r, "code_residency must be true or false");
+        } else if (strcmp(key, "game_height_percent") == 0) {
+            skip_ws(r);
+            const char * start = r->p;
+            while (r->p < r->end && *r->p >= '0' && *r->p <= '9') r->p++;
+            size_t n = (size_t) (r->p - start);
+            char number[16];
+            uint32_t value;
+            if (!n || n >= sizeof(number)) return fail(r, "game_height_percent must be an integer from 40 to 80");
+            memcpy(number, start, n); number[n] = '\0';
+            if (!frontend_config_parse_audio_buffer_ms(number, &value) || value < 40 || value > 80)
+                return fail(r, "game_height_percent must be an integer from 40 to 80");
+            cfg->game_height_percent = value;
+        } else if (strcmp(key, "audio_buffer_ms") == 0) {
+            skip_ws(r);
+            const char * start = r->p;
+            while (r->p < r->end && *r->p >= '0' && *r->p <= '9') r->p++;
+            if (r->p == start || (r->p < r->end && *r->p != ',' && *r->p != '}' &&
+                                  *r->p != ' ' && *r->p != '\t' && *r->p != '\n' && *r->p != '\r'))
+                return fail(r, "audio_buffer_ms must be an integer from 0 to 2000");
+            char number[16];
+            size_t n = (size_t) (r->p - start);
+            if (n >= sizeof(number)) return fail(r, "audio_buffer_ms must be an integer from 0 to 2000");
+            memcpy(number, start, n); number[n] = '\0';
+            if (!frontend_config_parse_audio_buffer_ms(number, &cfg->audio_buffer_ms))
+                return fail(r, "audio_buffer_ms must be an integer from 0 to 2000");
         } else if (strcmp(key, "frameskip") == 0) {
             char mode[16];
             if (!read_string(r, mode, sizeof(mode))) return false;
@@ -220,6 +257,9 @@ void frontend_config_default(frontend_config_t * cfg) {
     memset(cfg, 0, sizeof(*cfg));
     cfg->buttons = (1u << RETRO_DEVICE_ID_JOYPAD_B) | (1u << RETRO_DEVICE_ID_JOYPAD_A) |
                    (1u << RETRO_DEVICE_ID_JOYPAD_SELECT) | (1u << RETRO_DEVICE_ID_JOYPAD_START);
+    cfg->game_height_percent = 68;
+    cfg->audio_buffer_ms = 46;
+    cfg->code_residency = true;
 }
 
 bool frontend_config_parse(const char * json, size_t length, frontend_config_t * cfg, char * error, size_t error_size) {
@@ -294,4 +334,26 @@ bool frontend_config_parse_frameskip(const char * text, frameskip_mode_t * mode)
             return true;
         }
     return false;
+}
+
+bool frontend_config_parse_audio_buffer_ms(const char * text, uint32_t * value) {
+    if (!text || !*text || !value) return false;
+    uint32_t n = 0;
+    for (const char * p = text; *p; ++p) {
+        if (*p < '0' || *p > '9') return false;
+        unsigned digit = (unsigned) (*p - '0');
+        if (n > (2000u - digit) / 10u) return false;
+        n = n * 10u + digit;
+    }
+    if (n > 2000) return false;
+    *value = n;
+    return true;
+}
+
+bool frontend_config_parse_code_residency(const char * text, bool * enabled) {
+    if (!text || !enabled) return false;
+    if (strcmp(text, "on") == 0) *enabled = true;
+    else if (strcmp(text, "off") == 0) *enabled = false;
+    else return false;
+    return true;
 }

@@ -39,7 +39,12 @@ TARGET_CPU_FLAGS = -march=mips32r2 -mabi=32 -mfp32 -mno-odd-spreg -ffp-contract=
 TARGET_SECTION_FLAGS = -ffunction-sections -fdata-sections
 TARGET_LDFLAGS = -static -no-pie -Wl,--gc-sections -lpthread -lm
 
-FRONTEND_SRCS = frontend/frontend.c frontend/config.c frontend/stretch.c frontend/present.c frontend/xrun.c frontend/glyph5x7.c
+FRONTEND_SRCS = frontend/frontend.c frontend/video_scale.c frontend/residency.c frontend/audio_policy.c frontend/config.c frontend/stretch.c frontend/present.c frontend/xrun.c frontend/glyph5x7.c
+FRONTEND_HOT_FLAGS = $(if $(filter frontend/frontend.c frontend/video_scale.c,$<),-O3,)
+# Optional per-core final compiler flags for isolated device ablations, e.g.
+# make BUILD=build/pce-o2 CORE_OPT_pce="-O2 -fno-unroll-loops" stage-pce
+# Use a fresh BUILD directory when changing flags; make does not track their values.
+
 FRONTEND_CFLAGS = -std=gnu11 -O2 -Wall -Wextra -Werror -MMD -MP -Ifrontend
 TINYALSA_CFLAGS = -std=gnu11 -O2 -Wall -Wno-stringop-truncation -MMD -MP -I$(TINYALSA_DIR)/include -I$(TINYALSA_DIR)/src
 
@@ -80,6 +85,8 @@ $(1)_TARGET_CORE = $$($(1)_SRCS:third_party/$(1)/%=$(TARGET_DIR)/$(1)/core/%.o)
 $(1)_HOST_FRONT = $$(FRONTEND_SRCS:%.c=$(HOST_DIR)/$(1)/%.o)
 $(1)_TARGET_FRONT = $$(FRONTEND_SRCS:%.c=$(TARGET_DIR)/$(1)/%.o) $(TARGET_DIR)/$(1)/frontend/main.o
 
+$$($(1)_HOST_CORE) $$($(1)_TARGET_CORE) $$($(1)_HOST_FRONT) $$($(1)_TARGET_FRONT): Makefile $$(wildcard emulators/$(1)/core.mk experimental/$(1)/core.mk)
+
 $(HOST_DIR)/$(1)/core/%.c.o: third_party/$(1)/%.c | $$($(1)_READY)
 	@mkdir -p $$(dir $$@)
 	$$(CC) $$($(1)_CFLAGS) -MMD -MP -c $$< -o $$@
@@ -94,27 +101,27 @@ $(HOST_DIR)/$(1)/core/%.cpp.o: third_party/$(1)/%.cpp | $$($(1)_READY)
 
 $(TARGET_DIR)/$(1)/core/%.c.o: third_party/$(1)/%.c | $$($(1)_READY)
 	@mkdir -p $$(dir $$@)
-	$$(CROSS_CC) $$($(1)_CFLAGS) $$(TARGET_CPU_FLAGS) $$(TARGET_SECTION_FLAGS) -MMD -MP -c $$< -o $$@
+	$$(CROSS_CC) $$($(1)_CFLAGS) $$(CORE_OPT_$(1)) $$(TARGET_CPU_FLAGS) $$(TARGET_SECTION_FLAGS) -MMD -MP -c $$< -o $$@
 
 $(TARGET_DIR)/$(1)/core/%.S.o: third_party/$(1)/%.S | $$($(1)_READY)
 	@mkdir -p $$(dir $$@)
-	$$(CROSS_CC) $$($(1)_CFLAGS) $$(TARGET_CPU_FLAGS) $$(TARGET_SECTION_FLAGS) -MMD -MP -c $$< -o $$@
+	$$(CROSS_CC) $$($(1)_CFLAGS) $$(CORE_OPT_$(1)) $$(TARGET_CPU_FLAGS) $$(TARGET_SECTION_FLAGS) -MMD -MP -c $$< -o $$@
 
 $(TARGET_DIR)/$(1)/core/%.cc.o: third_party/$(1)/%.cc | $$($(1)_READY)
 	@mkdir -p $$(dir $$@)
-	$$(CROSS_CXX) $$($(1)_CXXFLAGS) $$(TARGET_CPU_FLAGS) $$(TARGET_SECTION_FLAGS) -MMD -MP -c $$< -o $$@
+	$$(CROSS_CXX) $$($(1)_CXXFLAGS) $$(CORE_OPT_$(1)) $$(TARGET_CPU_FLAGS) $$(TARGET_SECTION_FLAGS) -MMD -MP -c $$< -o $$@
 
 $(TARGET_DIR)/$(1)/core/%.cpp.o: third_party/$(1)/%.cpp | $$($(1)_READY)
 	@mkdir -p $$(dir $$@)
-	$$(CROSS_CXX) $$($(1)_CXXFLAGS) $$(TARGET_CPU_FLAGS) $$(TARGET_SECTION_FLAGS) -MMD -MP -c $$< -o $$@
+	$$(CROSS_CXX) $$($(1)_CXXFLAGS) $$(CORE_OPT_$(1)) $$(TARGET_CPU_FLAGS) $$(TARGET_SECTION_FLAGS) -MMD -MP -c $$< -o $$@
 
 $(HOST_DIR)/$(1)/frontend/%.o: frontend/%.c | $$($(1)_READY)
 	@mkdir -p $$(dir $$@)
-	$$(CC) $$(FRONTEND_CFLAGS) -DHOST_BUILD=1 -DEMULATOR_ID='"$(1)"' $$($(1)_INC) -c $$< -o $$@
+	$$(CC) $$(FRONTEND_CFLAGS) $$(FRONTEND_HOT_FLAGS) -DHOST_BUILD=1 -DEMULATOR_ID='"$(1)"' $$($(1)_INC) -c $$< -o $$@
 
 $(TARGET_DIR)/$(1)/frontend/%.o: frontend/%.c $(TINYALSA_DIR)/.pinned | $$($(1)_READY)
 	@mkdir -p $$(dir $$@)
-	$$(CROSS_CC) $$(FRONTEND_CFLAGS) -DEMULATOR_ID='"$(1)"' $$($(1)_INC) -I$(TINYALSA_DIR)/include \
+	$$(CROSS_CC) $$(FRONTEND_CFLAGS) $$(FRONTEND_HOT_FLAGS) -DEMULATOR_ID='"$(1)"' $$($(1)_INC) -I$(TINYALSA_DIR)/include \
 	    $$(TARGET_CPU_FLAGS) $$(TARGET_SECTION_FLAGS) -c $$< -o $$@
 
 $(HOST_DIR)/$(1)/selftest: frontend/selftest.c $$($(1)_HOST_FRONT) $$($(1)_HOST_CORE)
@@ -171,8 +178,24 @@ $(TARGET_DIR)/tinyalsa.a: $(TINYALSA_OBJS)
 -include $(TINYALSA_OBJS:.o=.d)
 
 # Manifests of every emulator against the player's real rules (tools/build_index.py).
-selftest:
+selftest: video-scale-selftest policy-selftest pcm-geometry-selftest
 	$(PYTHON) tools/build_index.py --check-manifests emulators
+
+$(HOST_DIR)/video_scale_selftest: frontend/video_scale_test.c frontend/video_scale.c frontend/video_scale.h
+	@mkdir -p $(HOST_DIR)
+	$(CC) $(FRONTEND_CFLAGS) -O3 frontend/video_scale_test.c frontend/video_scale.c -o $@
+
+.PHONY: video-scale-selftest
+video-scale-selftest: $(HOST_DIR)/video_scale_selftest
+	./$(HOST_DIR)/video_scale_selftest
+
+.PHONY: policy-selftest
+policy-selftest:
+	CC="$(CC)" frontend/test_policy.sh
+
+.PHONY: pcm-geometry-selftest
+pcm-geometry-selftest:
+	CC="$(CC)" $(PYTHON) frontend/test_pcm_geometry.py
 
 # Runs each device executable under qemu-mipsel on a test ROM, when both exist.
 smoke: all

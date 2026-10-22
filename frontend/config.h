@@ -13,7 +13,9 @@
  *                 "options": { "core_option_key": "value" },
  *                 "frameskip": "auto",
  *                 "skip_options": { "core_option_key": "value" },
- *                 "audio_stretch": false }
+ *                 "game_height_percent": 68,
+ *                 "audio_stretch": false,
+ *                 "code_residency": true }
  *
  * "buttons" lists the libretro joypad buttons that get on-screen controls
  * (a, b, x, y, l, r, select, start; the D-pad is always present).
@@ -25,10 +27,14 @@
  * are the option answers that replace "options" while a frame's video is
  * skipped, for a core that cannot skip rendering by itself but has options
  * that turn parts of it off.
+ * "game_height_percent" (integer 40..80, default 68) caps the game viewport
+ * height as a percentage of the display, retaining the original aspect ratio.
  * "audio_stretch" (true or false, default false): when the emulator falls
  * behind real time the audio is stretched (played slower and lower) so the
  * device buffer never runs dry; see stretch.h. Nothing changes while the
- * emulator keeps up. */
+ * emulator keeps up.
+ * "code_residency" (true or false, default true): pin executable code pages
+ * resident in memory after settings and command-line overrides are applied. */
 
 #define FRONTEND_MAX_OPTIONS 32
 #define FRONTEND_OPTION_TEXT 64
@@ -45,11 +51,14 @@ typedef enum {
 } frameskip_mode_t;
 
 typedef struct {
+    unsigned game_height_percent; /* viewport height cap, 40..80; default 68 */
     uint32_t buttons; /* bit n set: RETRO_DEVICE_ID_JOYPAD_<n> has a control */
     int option_count;
     frontend_option_t options[FRONTEND_MAX_OPTIONS];
     frameskip_mode_t frameskip;
     bool audio_stretch;
+    bool code_residency;
+    uint32_t audio_buffer_ms; /* target total buffer duration; 0 selects safe 1024-frame periods */
     int skip_option_count;
     frontend_option_t skip_options[FRONTEND_MAX_OPTIONS];
 } frontend_config_t;
@@ -74,5 +83,11 @@ bool frontend_config_set_option(frontend_config_t * cfg, const char * key, const
 
 /* "off", "auto" or "half"; false for anything else. */
 bool frontend_config_parse_frameskip(const char * text, frameskip_mode_t * mode);
+
+/* Strict base-10 integer in 0..2000. */
+bool frontend_config_parse_audio_buffer_ms(const char * text, uint32_t * value);
+
+/* "on" or "off" for --code-residency. */
+bool frontend_config_parse_code_residency(const char * text, bool * enabled);
 
 #endif /* FRONTEND_CONFIG_H */

@@ -11,6 +11,7 @@
  * "--frameskip off|auto|half" sets the frame skipping and "--skip-opt key=value" the
  * options used while video is skipped, all over emulator.json;
  * "--audio-stretch on|off" overrides "audio_stretch" (frontend/stretch.h);
+ * "--stats-interval N" logs interactive performance and process memory every N seconds;
  * "--budget-ms N" gives the frameskip policy of a bench another frame budget.
  * Returns the process exit status: 0 for a normal quit, 1 when the
  * ROM or display could not be opened, 2 for bad arguments, and the process
@@ -46,5 +47,10 @@ bool frontend_layout_check(int width, int height, int game_height, uint32_t butt
 
 /* Renders the controls (and the pause menu over them) for a screen size into a PPM file. */
 bool frontend_preview(int width, int height, int game_height, uint32_t buttons, bool with_menu, const char * ppm_path);
+
+#ifdef HOST_BUILD
+/* Checks raw-frame lifetime, async scaling and dynamic geometry in RAM. */
+bool frontend_video_pipeline_check(void);
+#endif
 
 #endif /* FRONTEND_H */

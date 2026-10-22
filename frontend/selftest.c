@@ -2,11 +2,13 @@
  * through the headless benchmark path and checks the frontend's video and
  * audio plumbing against the statically linked QuickNES core. */
 #include "config.h"
+#include "audio_policy.h"
 #include "frontend.h"
 #include "libretro.h"
 #include "present.h"
 #include "stretch.h"
 #include "xrun.h"
+#include "video_scale.h"
 
 #include <errno.h>
 #include <math.h>
@@ -55,6 +57,24 @@ static void check_config(void) {
     frontend_config_t c;
     char why[64];
     frontend_config_default(&c);
+    CHECK(c.audio_buffer_ms == 46, "default audio buffer is %u ms", c.audio_buffer_ms);
+    CHECK(c.code_residency, "code residency is not enabled by default");
+    CHECK(c.game_height_percent == 68, "default viewport height is %u percent", c.game_height_percent);
+    static const unsigned heights[] = {40, 55, 80};
+    for (size_t i = 0; i < sizeof(heights) / sizeof(heights[0]); ++i) {
+        char json[80];
+        snprintf(json, sizeof(json), "{\"frontend\":{\"game_height_percent\":%u}}", heights[i]);
+        CHECK(frontend_config_parse(json, strlen(json), &c, why, sizeof(why)) && c.game_height_percent == heights[i],
+              "viewport height %u rejected: %s", heights[i], why);
+    }
+    static const char * const height_bad[] = { "39", "81", "-1", "55.5", "5e1", "\"55\"", "true", "null", "[]",
+                                              "999999999999999999999999" };
+    for (size_t i = 0; i < sizeof(height_bad) / sizeof(height_bad[0]); ++i) {
+        char json[96];
+        snprintf(json, sizeof(json), "{\"frontend\":{\"game_height_percent\":%s}}", height_bad[i]);
+        CHECK(!frontend_config_parse(json, strlen(json), &c, why, sizeof(why)) && c.game_height_percent == 68,
+              "invalid viewport height %s accepted or did not restore default", height_bad[i]);
+    }
     CHECK(c.buttons == (BTN(RETRO_DEVICE_ID_JOYPAD_A) | BTN(RETRO_DEVICE_ID_JOYPAD_B) | BTN(RETRO_DEVICE_ID_JOYPAD_SELECT) |
                         BTN(RETRO_DEVICE_ID_JOYPAD_START)), "default buttons are not the NES set");
 
@@ -92,6 +112,56 @@ static void check_config(void) {
     CHECK(frontend_config_parse(stretch_on, sizeof(stretch_on) - 1, &c, why, sizeof(why)) && c.audio_stretch, "audio_stretch true");
     CHECK(frontend_config_parse(stretch_off, sizeof(stretch_off) - 1, &c, why, sizeof(why)) && !c.audio_stretch, "audio_stretch false");
     CHECK(frontend_config_parse("{}", 2, &c, why, sizeof(why)) && !c.audio_stretch, "audio_stretch default");
+    CHECK(c.code_residency, "code_residency default");
+    static const char residency_on[] = "{\"frontend\":{\"code_residency\":true}}";
+    static const char residency_off[] = "{\"frontend\":{\"code_residency\":false}}";
+    CHECK(frontend_config_parse(residency_on, sizeof(residency_on) - 1, &c, why, sizeof(why)) && c.code_residency,
+          "code_residency true: %s", why);
+    CHECK(frontend_config_parse(residency_off, sizeof(residency_off) - 1, &c, why, sizeof(why)) && !c.code_residency,
+          "code_residency false: %s", why);
+    static const char * const residency_bad[] = {
+        "{\"frontend\":{\"code_residency\":\"true\"}}", "{\"frontend\":{\"code_residency\":1}}",
+        "{\"frontend\":{\"code_residency\":null}}",
+    };
+    for (size_t i = 0; i < sizeof(residency_bad) / sizeof(residency_bad[0]); ++i)
+        CHECK(!frontend_config_parse(residency_bad[i], strlen(residency_bad[i]), &c, why, sizeof(why)),
+              "accepted invalid code_residency %zu", i);
+    bool residency_enabled = false;
+    CHECK(frontend_config_parse_code_residency("on", &residency_enabled) && residency_enabled,
+          "CLI code residency on");
+    CHECK(frontend_config_parse_code_residency("off", &residency_enabled) && !residency_enabled,
+          "CLI code residency off");
+    CHECK(!frontend_config_parse_code_residency("true", &residency_enabled) &&
+          !frontend_config_parse_code_residency("bad", &residency_enabled), "CLI accepted invalid code residency");
+    CHECK(c.audio_buffer_ms == 46, "audio buffer default is %u ms", c.audio_buffer_ms);
+    static const char audio_short[] = "{\"frontend\":{\"audio_buffer_ms\":46}}";
+    static const char audio_safe[] = "{\"frontend\":{\"audio_buffer_ms\":0}}";
+    static const char audio_max[] = "{\"frontend\":{\"audio_buffer_ms\":2000}}";
+    CHECK(frontend_config_parse(audio_short, sizeof(audio_short) - 1, &c, why, sizeof(why)) && c.audio_buffer_ms == 46,
+          "audio_buffer_ms short value: %s", why);
+    CHECK(frontend_config_parse(audio_safe, sizeof(audio_safe) - 1, &c, why, sizeof(why)) && c.audio_buffer_ms == 0,
+          "audio_buffer_ms safe value: %s", why);
+    CHECK(frontend_config_parse(audio_max, sizeof(audio_max) - 1, &c, why, sizeof(why)) && c.audio_buffer_ms == 2000,
+          "audio_buffer_ms maximum: %s", why);
+    uint32_t parsed_ms;
+    CHECK(frontend_config_parse_audio_buffer_ms("00046", &parsed_ms) && parsed_ms == 46,
+          "CLI audio buffer parser rejected decimal value");
+    static const char * const audio_bad[] = {
+        "{\"frontend\":{\"audio_buffer_ms\":-1}}", "{\"frontend\":{\"audio_buffer_ms\":2001}}",
+        "{\"frontend\":{\"audio_buffer_ms\":46.5}}", "{\"frontend\":{\"audio_buffer_ms\":\"46\"}}",
+        "{\"frontend\":{\"audio_buffer_ms\":true}}", "{\"frontend\":{\"audio_buffer_ms\":1e2}}",
+    };
+    for (size_t i = 0; i < sizeof(audio_bad) / sizeof(audio_bad[0]); ++i)
+        CHECK(!frontend_config_parse(audio_bad[i], strlen(audio_bad[i]), &c, why, sizeof(why)),
+              "accepted invalid audio_buffer_ms %zu", i);
+    CHECK(!frontend_config_parse_audio_buffer_ms("46x", &parsed_ms) &&
+          !frontend_config_parse_audio_buffer_ms("-1", &parsed_ms) &&
+          !frontend_config_parse_audio_buffer_ms("2001", &parsed_ms), "CLI accepted invalid audio buffer");
+    CHECK(audio_policy_period_frames(44100, 46) == 512 && audio_policy_period_frames(48000, 46) == 512 &&
+          audio_policy_period_frames(48000, 0) == AUDIO_POLICY_SAFE_PERIOD_FRAMES,
+          "audio period policy does not honor short/safe settings");
+    CHECK(audio_policy_open_fallback(512, false) == AUDIO_POLICY_SAFE_PERIOD_FRAMES &&
+          audio_policy_restore_safe(512, AUDIO_POLICY_UNDERRUN_LIMIT), "audio policy fallback");
     static const char stretch_bad[] = "{\"frontend\":{\"audio_stretch\":\"yes\"}}";
     CHECK(!frontend_config_parse(stretch_bad, sizeof(stretch_bad) - 1, &c, why, sizeof(why)), "audio_stretch \"yes\" accepted");
 
@@ -110,6 +180,21 @@ static void check_config(void) {
 }
 
 static void check_layouts(void) {
+    /* Portrait WonderSwan keeps its 144:224 aspect while giving controls 360 rows. */
+    video_scale_t portrait;
+    frontend_config_t config;
+    char why[200];
+    static const char ws_layout[] = "{\"frontend\":{\"game_height_percent\":55}}";
+    CHECK(frontend_config_parse(ws_layout, sizeof(ws_layout) - 1, &config, why, sizeof(why)), "%s", why);
+    int cap = 800 * (int) config.game_height_percent / 100;
+    CHECK(cap == 440 && video_scale_init(&portrait, 144, 224, 480, cap) &&
+          portrait.game_h == 440 && portrait.draw_w == 282 && portrait.draw_x0 == 99,
+          "portrait WonderSwan viewport lost its aspect or height cap");
+    uint32_t ws_buttons = BTN(RETRO_DEVICE_ID_JOYPAD_B) | BTN(RETRO_DEVICE_ID_JOYPAD_A) |
+                          BTN(RETRO_DEVICE_ID_JOYPAD_X) | BTN(RETRO_DEVICE_ID_JOYPAD_Y) |
+                          BTN(RETRO_DEVICE_ID_JOYPAD_L) | BTN(RETRO_DEVICE_ID_JOYPAD_R) |
+                          BTN(RETRO_DEVICE_ID_JOYPAD_SELECT) | BTN(RETRO_DEVICE_ID_JOYPAD_START);
+    CHECK(frontend_layout_check(480, 800, cap, ws_buttons, why, sizeof(why)), "%s", why);
     static const struct { int w, h; } screens[] = { { 480, 800 }, { 480, 720 }, { 320, 480 } };
     static const uint32_t sets[] = {
         BTN(RETRO_DEVICE_ID_JOYPAD_B) | BTN(RETRO_DEVICE_ID_JOYPAD_A) | BTN(RETRO_DEVICE_ID_JOYPAD_SELECT) | BTN(RETRO_DEVICE_ID_JOYPAD_START),
@@ -477,6 +562,10 @@ int main(int argc, char ** argv) {
     if (argc == 8 && strcmp(argv[1], "--preview") == 0) /* W H GAME_H BUTTON_MASK MENU(0/1) PPM */
         return frontend_preview(atoi(argv[2]), atoi(argv[3]), atoi(argv[4]), (uint32_t) strtoul(argv[5], NULL, 0),
                                 atoi(argv[6]) != 0, argv[7]) ? 0 : 1;
+    char * bad_stats_zero[] = { (char *) "selftest", (char *) "unused.rom", (char *) "--stats-interval", (char *) "0" };
+    char * bad_stats_text[] = { (char *) "selftest", (char *) "unused.rom", (char *) "--stats-interval", (char *) "1x" };
+    CHECK(frontend_main(4, bad_stats_zero) == 2, "--stats-interval 0 was accepted");
+    CHECK(frontend_main(4, bad_stats_text) == 2, "non-numeric --stats-interval was accepted");
     char path[] = "/tmp/frontend_selftest_XXXXXX";
     int fd = mkstemp(path);
     if (fd < 0) {
@@ -490,6 +579,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    CHECK(frontend_video_pipeline_check(), "native video pipeline did not preserve its last frame");
     frontend_bench_t r;
     bool loaded = frontend_bench(path, FRAMES, &r);
     unlink(path);

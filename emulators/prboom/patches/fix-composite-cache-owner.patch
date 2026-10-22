@@ -1,0 +1,32 @@
+--- a/src/r_patch.c
++++ b/src/r_patch.c
+@@ -484,7 +484,8 @@
+   /* columns offset rounded to 8 for rcolumn_t alignment; see createPatch */
+   dataSize = 8 + ((pixelDataSize + composite_patch->height + 7) & ~7)
+              + columnsDataSize + postsDataSize;
+-  composite_patch->data = (unsigned char *)Z_Malloc(dataSize, PU_STATIC, NULL);
++  composite_patch->data = (unsigned char *)Z_Malloc(dataSize, PU_STATIC,
++                                         (void **)&composite_patch->data);
+   memset(composite_patch->data, 0, dataSize);
+   memset(composite_patch->data, 0xff, 8);
+ 
+@@ -594,8 +595,7 @@
+   /* columns offset rounded to 8 for rcolumn_t alignment; see createPatch */
+   dataSize = ((pixelDataSize + composite_patch->height + 7) & ~7)
+              + columnsDataSize + postsDataSize;
+-  /* See r_patch.c:238 — back-pointer would point into texture_composites[],
+-   * unsafe at teardown.  No user back-pointer here. */
++  /* Purging must clear this owner slot; teardown frees blocks before the array. */
+   /* Eight bytes of 0xff lead padding before the pixels: the filtered
+    * drawers index source[frac>>16] on the signed frac, which reaches
+    * -1 on a column's first rows when the half-texel centering pushes
+@@ -606,7 +606,8 @@
+    * keep the rcolumn_t/rpost_t arrays after the pixels aligned.
+    * Companion to the trailing padding column below. */
+   dataSize += 8;
+-  composite_patch->data = (unsigned char*)Z_Malloc(dataSize, PU_STATIC, NULL);
++  composite_patch->data = (unsigned char*)Z_Malloc(dataSize, PU_STATIC,
++                                         (void **)&composite_patch->data);
+   memset(composite_patch->data, 0, dataSize);
+   memset(composite_patch->data, 0xff, 8);
+ 

@@ -1,0 +1,47 @@
+#!/bin/sh
+
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+export HOME=/root
+export PS1='compas-r1-vm# '
+hostname compas-r1-vm
+
+# The ext4 root disk is already mounted by the kernel as /. Make it writable
+# and expose the virtual SD card at the same path used by the player.
+mount -o remount,rw / 2>/dev/null || true
+mkdir -p /proc /sys /dev /dev/pts /usr/data/mnt/sd_0
+mount -t proc proc /proc 2>/dev/null || true
+mount -t sysfs sysfs /sys 2>/dev/null || true
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+mount -t devpts devpts /dev/pts 2>/dev/null || true
+
+# Malta disks are attached as virtio block devices by the VM launcher. Mount
+# the second disk when present; the directory remains usable if no SD image is
+# configured for a particular run.
+if [ -b /dev/vdb ]; then
+    mount -t ext4 /dev/vdb /usr/data/mnt/sd_0 2>/dev/null || true
+elif [ -b /dev/sdb ]; then
+    mount -t ext4 /dev/sdb /usr/data/mnt/sd_0 2>/dev/null || true
+fi
+
+# Match the R1's 24 MiB compressed swap capacity. Leave swappiness at Linux's
+# usual value (60); the real R1 kernel's setting has not been established.
+if [ -e /sys/block/zram0/disksize ] && [ -e /dev/zram0 ]; then
+    echo lz4 > /sys/block/zram0/comp_algorithm 2>/dev/null || true
+    echo 25165824 > /sys/block/zram0/disksize 2>/dev/null || true
+    mkswap /dev/zram0 >/dev/null 2>&1 && swapon /dev/zram0 2>/dev/null || true
+    if [ -w /proc/sys/vm/swappiness ]; then
+        echo 60 > /proc/sys/vm/swappiness
+    fi
+fi
+
+echo
+echo 'Compas HiBy R1 system VM'
+echo 'Root filesystem: persistent ext4 disk; virtual SD: /usr/data/mnt/sd_0'
+echo 'No board drivers, adbd, or network services are started.'
+echo 'Memory:'
+cat /proc/meminfo 2>/dev/null | head -n 5
+echo 'Swap:'
+cat /proc/swaps 2>/dev/null
+echo 'Zram algorithm (selected value is bracketed):'
+cat /sys/block/zram0/comp_algorithm 2>/dev/null
+echo R1_VM_READY

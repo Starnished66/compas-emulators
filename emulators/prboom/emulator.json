@@ -1,7 +1,7 @@
 {
   "id": "prboom",
   "name": "PrBoom",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "protocol": 1,
   "exec": "prboom",
   "free_player_memory": true,
@@ -19,7 +19,7 @@
       "prboom-render_threads": "OFF",
       "prboom-find_recursive_on": "disabled",
       "prboom-mmap_wads": "enabled",
-      "prboom-purge_limit": "16",
+      "prboom-purge_limit": "8",
       "prboom-wall_decals": "disabled",
       "prboom-sound_samplerate": "48000"
     }
