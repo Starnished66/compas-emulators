@@ -22,6 +22,8 @@ to the executable.
 
 PrBoom applies a tracked upstream-source patch when fetched: composite texture allocations register their
 cache owner pointers, so purging under the 8 MiB threshold clears stale entries before they are reused.
+Gearboy also applies a tracked core patch so restored clock state includes elapsed time between sessions without
+counting the previous session twice.
 
 ## Controls
 
@@ -66,6 +68,8 @@ the rows RESUME, SAVE STATE, LOAD STATE, RESET and EXIT. Tap a row to use it; th
 - LOAD STATE restores it and resumes; it is greyed out when there is no state file. A state of another size shows FAILED.
 - Both are greyed out for a core that cannot save states.
 - RESET restarts the game and resumes. EXIT leaves the emulator (battery saves are written as usual).
+
+Battery RAM is saved beside the ROM as `<game name>.srm`. Cores with a battery-backed real-time clock, including Gearboy MBC3 games, also save `<game name>.rtc`. Keep both files when backing up a game. The clock can then retain its state and account for elapsed time between sessions; existing `.srm` saves remain unchanged. RTC sidecars are core-specific, so files from another emulator are not assumed compatible.
 
 ## Emulator settings in `emulator.json`
 
@@ -179,7 +183,8 @@ PATH=../compas-player/toolchains/mipsel-linux-musl-cross/bin:$PATH make
 | `make package TAG=v...` | stages each emulator and writes `dist/` with `index.json`; `TAG` defaults to `dev` |
 
 Cores and tinyalsa are fetched into `third_party/` (gitignored), pinned by commit (each `emulators/<id>/core.mk` has
-its URL and SHA); no core is patched. `make distclean` removes them.
+its URL and SHA). Tracked compatibility patches are declared in the relevant `core.mk` and applied after fetching.
+`make distclean` removes the fetched sources.
 
 `tools/build_index.py --validate dist` re-checks a finished `dist/` against the protocol, including every file's size
 and SHA-256.

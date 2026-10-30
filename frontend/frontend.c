@@ -1584,16 +1584,31 @@ static void save_path(const char * rom, const char * suffix, char * out, size_t 
     snprintf(out + len, size - len, "%s", suffix);
 }
 
-static void sram_load(const char * rom) {
+static void battery_load(const char * rom) {
     size_t n = retro_get_memory_size(RETRO_MEMORY_SAVE_RAM);
     void * mem = retro_get_memory_data(RETRO_MEMORY_SAVE_RAM);
-    if (!n || !mem) return;
     char path[640];
     save_path(rom, ".srm", path, sizeof(path));
+    if (n && mem) {
+        FILE * f = fopen(path, "rb");
+        if (f) {
+            if (fread(mem, 1, n, f) != n) runner_log("sram: short read from %s", path);
+            fclose(f);
+        }
+    }
+
+    n = retro_get_memory_size(RETRO_MEMORY_RTC);
+    mem = retro_get_memory_data(RETRO_MEMORY_RTC);
+    if (!n || !mem) return;
+    save_path(rom, ".rtc", path, sizeof(path));
     FILE * f = fopen(path, "rb");
     if (!f) return;
-    if (fread(mem, 1, n, f) != n) runner_log("sram: short read from %s", path);
-    fclose(f);
+    void * staged = malloc(n);
+    bool valid = staged && fread(staged, 1, n, f) == n && fgetc(f) == EOF && !ferror(f);
+    valid = fclose(f) == 0 && valid;
+    if (valid) memcpy(mem, staged, n);
+    else runner_log("rtc: invalid save file %s", path);
+    free(staged);
 }
 
 /* Temp file plus rename, so a power loss never leaves a truncated save. */
@@ -1615,13 +1630,21 @@ static bool write_file_atomic(const char * path, const void * mem, size_t n) {
     return true;
 }
 
-static void sram_save(const char * rom) {
+static void battery_save(const char * rom) {
     size_t n = retro_get_memory_size(RETRO_MEMORY_SAVE_RAM);
     const void * mem = retro_get_memory_data(RETRO_MEMORY_SAVE_RAM);
-    if (!n || !mem) return;
     char path[640];
-    save_path(rom, ".srm", path, sizeof(path));
-    write_file_atomic(path, mem, n);
+    if (n && mem) {
+        save_path(rom, ".srm", path, sizeof(path));
+        write_file_atomic(path, mem, n);
+    }
+
+    n = retro_get_memory_size(RETRO_MEMORY_RTC);
+    mem = retro_get_memory_data(RETRO_MEMORY_RTC);
+    if (n && mem) {
+        save_path(rom, ".rtc", path, sizeof(path));
+        write_file_atomic(path, mem, n);
+    }
 }
 
 /* One save state slot, "<rom without extension>.state". */
@@ -2333,7 +2356,7 @@ static int run_interactive(const char * rom, unsigned stats_interval) {
         core_stop(rom_data);
         return 1;
     }
-    sram_load(rom);
+    battery_load(rom);
     max_game_h = surf_h * (int) cfg.game_height_percent / 100;
     build_maps((int) av.geometry.base_width, (int) av.geometry.base_height);
     layout_controls(game_h);
@@ -2458,7 +2481,7 @@ static int run_interactive(const char * rom, unsigned stats_interval) {
                    (unsigned long long) frames);
 
     wait_for_release();
-    sram_save(rom);
+    battery_save(rom);
     audio_close();
     input_close();
     presenter_stop();

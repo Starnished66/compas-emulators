@@ -1,0 +1,80 @@
+--- a/src/MBC3MemoryRule.cpp
++++ b/src/MBC3MemoryRule.cpp
+@@ -657,6 +657,8 @@
+         m_pCartridge->UpdateCurrentRTC();
+         m_RTCLastTimeCache = 0;
+         UpdateRTC();
++        // A native load is already reconciled, including a halted clock.
++        m_RTCLastTimeCache = m_RTC.LastTime;
+     }
+ 
+     Debug("MBC3MemoryRule load RAM done");
+@@ -721,7 +723,24 @@
+ 
+ u8* MBC3MemoryRule::GetRTCMemory()
+ {
+-    return m_pCartridge->IsRTCPresent() ? reinterpret_cast<u8*>(&m_RTC) : NULL;
++    if (!m_pCartridge->IsRTCPresent())
++        return NULL;
++
++    m_pCartridge->UpdateCurrentRTC();
++    s32 now = static_cast<s32>(m_pCartridge->GetCurrentRTC());
++    // The frontend restores this buffer directly. A timestamp different
++    // from our cache identifies a restored battery snapshot, not game time
++    // already advanced by TickRTC(). Catch up only that offline interval.
++    if (m_RTC.LastTime != m_RTCLastTimeCache)
++    {
++        m_RTCLastTimeCache = 0;
++        UpdateRTC();
++    }
++    // Timestamp the snapshot at export, so the next session does not add
++    // the previous session's emulated time a second time.
++    m_RTC.LastTime = now;
++    m_RTCLastTimeCache = now;
++    return reinterpret_cast<u8*>(&m_RTC);
+ }
+ 
+ void MBC3MemoryRule::SaveState(std::ostream& stream)
+@@ -776,6 +795,8 @@
+     stream.read(reinterpret_cast<char*> (&m_CurrentROMAddress), sizeof(m_CurrentROMAddress));
+     stream.read(reinterpret_cast<char*> (&m_CurrentRAMAddress), sizeof(m_CurrentRAMAddress));
+     stream.read(reinterpret_cast<char*> (&m_RTC), sizeof(m_RTC));
++    // A save state restores emulated time, not an offline battery interval.
++    m_RTCLastTimeCache = m_RTC.LastTime;
+     m_RTC.Days = (m_RTC.Days & 0xFF) | ((m_RTC.Control & 0x01) << 8);
+ 
+     if (IsPKJD())
+--- a/platforms/libretro/libretro.cpp
++++ b/platforms/libretro/libretro.cpp
+@@ -108,6 +108,7 @@
+ static int link_audio = 0;
+ static bool link_subsystem = false;
+ static bool game_loaded = false;
++static bool rtc_restore_pending = false;
+ static bool barcode_enabled = false;
+ static Cartridge::CartridgeTypes mapper = Cartridge::CartridgeNotSupported;
+ static const retro_vfs_interface* vfs_interface = NULL;
+@@ -1033,6 +1034,15 @@
+     if (!game_loaded)
+         return;
+ 
++    // The frontend loads battery memory after retro_load_game returns.
++    // Let the mapper reconcile restored RTC data before the first frame.
++    if (rtc_restore_pending)
++    {
++        for (unsigned i = 0; i < instance_count; i++)
++            instances[i].core->GetMemory()->GetCurrentRule()->GetRTCMemory();
++        rtc_restore_pending = false;
++    }
++
+     bool updated = false;
+ 
+     if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
+@@ -1258,6 +1268,7 @@
+     environ_cb(RETRO_ENVIRONMENT_SET_SUPPORT_ACHIEVEMENTS, &achievements);
+ 
+     game_loaded = true;
++    rtc_restore_pending = true;
+ 
+     update_sensors();
+ 
