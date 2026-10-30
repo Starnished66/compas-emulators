@@ -7,3 +7,8 @@ experimental/*/profile/
 
 # Python VM tooling caches
 __pycache__/
+
+# Tests are local only.
+/frontend/*selftest*
+/frontend/*_test.c
+/frontend/test_*

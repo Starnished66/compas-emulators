@@ -24,8 +24,8 @@ the core.
 6. Add the `frontend` object to `emulator.json` if the system needs other buttons than the NES set (README.md), and
    core option defaults the core would not choose itself (`options`).
 7. Add a test ROM to `tools/smoke.sh` (a freely licensed one downloaded in `tools/fetch_test_roms.sh`, or a tiny
-   original one from `tools/make_test_roms.py`), then run `make`, `make smoke` and `make selftest`, and try the
-   executable on a device. `make selftest` (`frontend/selftest.c`) is NES based and checks the frontend itself; the
+   original one from `tools/make_test_roms.py`), then run `make`, `make smoke` and `make check`, and try the
+   executable on a device. `make check` validates the manifests; the
    smoke test runs `--bench` under qemu and reports a save state round trip for each core.
 
 Things learned the hard way:
@@ -34,7 +34,7 @@ Things learned the hard way:
   `SOURCE_DIR`, `SOURCES_C`...) are overwritten by the next core. Use `:=` for lists taken from it, and build the
   flags from `<id>_DIR`, never from those shared names (a lazy `=` flag would see the last core's value).
 - `tools/build_index.py --check-manifests emulators` applies the limits of the player's own parser, which are
-  stricter than PROTOCOL.md in places (system id <= 15, system name <= 32, catalog <= 64 KiB). Run `make selftest`.
+  stricter than PROTOCOL.md in places (system id <= 15, system name <= 32, catalog <= 64 KiB). Run `make check`.
 - Check the license of every compiled source file, not only the repository: some cores bundle a CPU or sound chip
   emulator under different terms. Ship notices for them in the `LICENSE.*` file.
 - A core with a MIPS dynamic recompiler (gpSP) must be built with the `-fPIC -DPIC` its MIPS platforms use: the

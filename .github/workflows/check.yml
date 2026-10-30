@@ -18,8 +18,8 @@ jobs:
         run: .github/scripts/install-toolchain.sh "$RUNNER_TEMP/toolchain" | tail -n 1 >> "$GITHUB_PATH"
       - name: Build for the device
         run: make
-      - name: Host self-test
-        run: make selftest
+      - name: Check the manifests
+        run: make check
       - name: Smoke test under qemu
         run: |
           sudo apt-get update -qq

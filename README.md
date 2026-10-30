@@ -174,7 +174,7 @@ PATH=../compas-player/toolchains/mipsel-linux-musl-cross/bin:$PATH make
 | Command | Result |
 | --- | --- |
 | `make` | `build/target/<id>/<id>`, a static stripped MIPS32 executable per emulator |
-| `make selftest` | builds the frontend and QuickNES for the host and runs the self-test (frontend layout, settings parser, save state round trip), checks PCM negotiation/threshold handling, and checks every manifest (needs a host compiler and Python 3) |
+| `make check` | checks every manifest against the player's rules (needs Python 3) |
 | `make smoke` | runs every executable under `qemu-mipsel` on a test ROM (`tools/fetch_test_roms.sh` fetches them); skipped if qemu is missing |
 | `make package TAG=v...` | stages each emulator and writes `dist/` with `index.json`; `TAG` defaults to `dev` |
 

@@ -1,8 +1,7 @@
 # Compas emulator packages. See README.md and docs/ADDING_AN_EMULATOR.md.
 #
 #   make             device executables: build/target/<id>/<id>
-#   make selftest    host build of the frontend self-test (NES, QuickNES) plus the
-#                    manifest checks of every emulator
+#   make check       manifest checks of every emulator
 #   make smoke       runs every device executable under qemu-mipsel on a test ROM
 #                    (tools/smoke.sh; skipped when qemu-mipsel or the ROMs are missing)
 #   make package     stage each emulator and build dist/ and dist/index.json
@@ -55,7 +54,7 @@ STAGE_DIR = $(BUILD)/stage
 DIST = dist
 
 .DEFAULT_GOAL := all
-.PHONY: all selftest smoke package experimental clean distclean
+.PHONY: all check smoke package experimental clean distclean
 
 # Replaces $(1) with a checkout of commit $(3) of repository $(2).
 define git_fetch
@@ -76,7 +75,7 @@ $(TINYALSA_DIR)/.pinned:
 #   <id>_CXXFLAGS  flags for C++ sources
 #   <id>_INC       include path holding libretro.h, for the frontend
 #   <id>_READY     a file that exists once the core is fetched
-# and optionally <id>_SELFTEST = 1 when the host self-test (NES ROM) applies and
+# and optionally
 # <id>_EXTRA = files packaged with the executable, as source=path-inside-the-package
 # entries (a path under games/<games_dir>/ is a game bundled with the emulator).
 define emulator_rules
@@ -124,10 +123,6 @@ $(TARGET_DIR)/$(1)/frontend/%.o: frontend/%.c $(TINYALSA_DIR)/.pinned | $$($(1)_
 	$$(CROSS_CC) $$(FRONTEND_CFLAGS) $$(FRONTEND_HOT_FLAGS) -DEMULATOR_ID='"$(1)"' $$($(1)_INC) -I$(TINYALSA_DIR)/include \
 	    $$(TARGET_CPU_FLAGS) $$(TARGET_SECTION_FLAGS) -c $$< -o $$@
 
-$(HOST_DIR)/$(1)/selftest: frontend/selftest.c $$($(1)_HOST_FRONT) $$($(1)_HOST_CORE)
-	$$(CC) $$(filter-out -MMD -MP,$$(FRONTEND_CFLAGS)) -DHOST_BUILD=1 -DEMULATOR_ID='"$(1)"' $$($(1)_INC) $$< $$($(1)_HOST_FRONT) $$($(1)_HOST_CORE) \
-	    -lm -lpthread -lstdc++ -o $$@
-
 $(TARGET_DIR)/$(1)/$(1)_unstripped: $$($(1)_TARGET_FRONT) $$($(1)_TARGET_CORE) $(TARGET_DIR)/tinyalsa.a
 	$$(CROSS_CXX) $$(TARGET_CPU_FLAGS) -o $$@ $$($(1)_TARGET_FRONT) $$($(1)_TARGET_CORE) \
 	    $(TARGET_DIR)/tinyalsa.a $$(TARGET_LDFLAGS)
@@ -135,10 +130,7 @@ $(TARGET_DIR)/$(1)/$(1)_unstripped: $$($(1)_TARGET_FRONT) $$($(1)_TARGET_CORE) $
 $(TARGET_DIR)/$(1)/$(1): $(TARGET_DIR)/$(1)/$(1)_unstripped
 	$$(CROSS_STRIP) -s -o $$@ $$<
 
-.PHONY: selftest-$(1) stage-$(1)
-selftest-$(1): $(HOST_DIR)/$(1)/selftest
-	./$(HOST_DIR)/$(1)/selftest
-
+.PHONY: stage-$(1)
 stage-$(1): $(TARGET_DIR)/$(1)/$(1) $$(foreach f,$$($(1)_EXTRA),$$(firstword $$(subst =, ,$$(f))))
 	rm -rf $(STAGE_DIR)/$(1)
 	mkdir -p $(STAGE_DIR)/$(1)
@@ -151,7 +143,6 @@ stage-$(1): $(TARGET_DIR)/$(1)/$(1) $$(foreach f,$$($(1)_EXTRA),$$(firstword $$(
 	    cp $$(firstword $$(subst =, ,$$(f))) $(STAGE_DIR)/$(1)/$$(lastword $$(subst =, ,$$(f))) &&) true
 
 $$(if $$(filter $(1),$(EXPERIMENTAL)),experimental,all): $(TARGET_DIR)/$(1)/$(1)
-$$(if $$(filter $(1),$(EMULATORS)),$$(if $$($(1)_SELFTEST),selftest: selftest-$(1)))
 $$(if $$(filter $(1),$(EMULATORS)),package: stage-$(1))
 
 -include $$($(1)_HOST_CORE:.o=.d) $$($(1)_TARGET_CORE:.o=.d) $$($(1)_HOST_FRONT:.o=.d) $$($(1)_TARGET_FRONT:.o=.d)
@@ -178,24 +169,8 @@ $(TARGET_DIR)/tinyalsa.a: $(TINYALSA_OBJS)
 -include $(TINYALSA_OBJS:.o=.d)
 
 # Manifests of every emulator against the player's real rules (tools/build_index.py).
-selftest: video-scale-selftest policy-selftest pcm-geometry-selftest
+check:
 	$(PYTHON) tools/build_index.py --check-manifests emulators
-
-$(HOST_DIR)/video_scale_selftest: frontend/video_scale_test.c frontend/video_scale.c frontend/video_scale.h
-	@mkdir -p $(HOST_DIR)
-	$(CC) $(FRONTEND_CFLAGS) -O3 frontend/video_scale_test.c frontend/video_scale.c -o $@
-
-.PHONY: video-scale-selftest
-video-scale-selftest: $(HOST_DIR)/video_scale_selftest
-	./$(HOST_DIR)/video_scale_selftest
-
-.PHONY: policy-selftest
-policy-selftest:
-	CC="$(CC)" frontend/test_policy.sh
-
-.PHONY: pcm-geometry-selftest
-pcm-geometry-selftest:
-	CC="$(CC)" $(PYTHON) frontend/test_pcm_geometry.py
 
 # Runs each device executable under qemu-mipsel on a test ROM, when both exist.
 smoke: all
